@@ -4,12 +4,14 @@
 //! - Acts as a system that sends high profit bundles and transactions to a validator.
 //! - Sends transactions and bundles to the validator.
 
+use futures_util::TryFutureExt;
+use tokio::sync::RwLock;
 use {
     crate::{
         packet_bundle::PacketBundle,
         proto_packet_to_packet,
         proxy::{
-            auth::{generate_auth_tokens, maybe_refresh_access_token, AuthInterceptor},
+            auth::{generate_auth_tokens, maybe_refresh_auth_tokens, AuthInterceptor},
             ProxyError,
         },
         sigverify::SigverifyTracerPacketStats,
@@ -45,6 +47,8 @@ use {
     uuid::Uuid,
 };
 
+const CONNECTION_TIMEOUT_S: u64 = 10;
+
 #[derive(Default)]
 struct BlockEngineStageStats {
     num_bundles: u64,
@@ -70,7 +74,7 @@ pub struct BlockBuilderFeeInfo {
     pub block_builder_commission: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq)]
 pub struct BlockEngineConfig {
     /// Address to the external auth-service responsible for generating access tokens.
     pub auth_service_endpoint: Endpoint,
@@ -82,13 +86,22 @@ pub struct BlockEngineConfig {
     pub trust_packets: bool,
 }
 
+impl PartialEq for BlockEngineConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.auth_service_endpoint.uri() == other.auth_service_endpoint.uri()
+            && self.backend_endpoint.uri() == other.backend_endpoint.uri()
+            && self.trust_packets == other.trust_packets
+    }
+}
+
 pub struct BlockEngineStage {
+    maybe_block_engine_config: Arc<std::sync::RwLock<Option<BlockEngineConfig>>>,
     t_hdls: Vec<JoinHandle<()>>,
 }
 
 impl BlockEngineStage {
     pub fn new(
-        block_engine_config: BlockEngineConfig,
+        maybe_block_engine_config: Arc<std::sync::RwLock<Option<BlockEngineConfig>>>,
         // Channel that bundles get piped through.
         bundle_tx: Sender<Vec<PacketBundle>>,
         // The keypair stored here is used to sign auth challenges.
@@ -110,7 +123,7 @@ impl BlockEngineStage {
                     .build()
                     .unwrap();
                 rt.block_on(Self::start(
-                    block_engine_config,
+                    maybe_block_engine_config.clone(),
                     cluster_info,
                     bundle_tx,
                     packet_tx,
@@ -122,6 +135,7 @@ impl BlockEngineStage {
             .unwrap();
 
         Self {
+            maybe_block_engine_config,
             t_hdls: vec![thread],
         }
     }
@@ -135,7 +149,7 @@ impl BlockEngineStage {
 
     #[allow(clippy::too_many_arguments)]
     async fn start(
-        block_engine_config: BlockEngineConfig,
+        maybe_block_engine_config: Arc<std::sync::RwLock<Option<BlockEngineConfig>>>,
         cluster_info: Arc<ClusterInfo>,
         bundle_tx: Sender<Vec<PacketBundle>>,
         packet_tx: Sender<PacketBatch>,
@@ -149,7 +163,7 @@ impl BlockEngineStage {
 
         while !exit.load(Ordering::Relaxed) {
             match Self::connect_auth_and_stream(
-                &block_engine_config,
+                &maybe_block_engine_config,
                 &cluster_info,
                 &bundle_tx,
                 &packet_tx,
@@ -173,7 +187,7 @@ impl BlockEngineStage {
     }
 
     async fn connect_auth_and_stream(
-        block_engine_config: &BlockEngineConfig,
+        maybe_block_engine_config: &Arc<std::sync::RwLock<Option<BlockEngineConfig>>>,
         cluster_info: &Arc<ClusterInfo>,
         bundle_tx: &Sender<Vec<PacketBundle>>,
         packet_tx: &Sender<PacketBatch>,
@@ -182,6 +196,14 @@ impl BlockEngineStage {
         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
         connection_timeout: &Duration,
     ) -> crate::proxy::Result<()> {
+        // Get Configs here in case they have changed at runtime
+        let block_engine_config = maybe_block_engine_config
+            .read()
+            .unwrap()
+            .clone()
+            .expect("Starting Block Engine with No Config");
+        let keypair = *cluster_info.keypair().clone();
+
         debug!(
             "connecting to auth: {:?}",
             block_engine_config.auth_service_endpoint.uri()
@@ -196,10 +218,8 @@ impl BlockEngineStage {
 
         let mut auth_client = AuthServiceClient::new(auth_channel);
 
-        let keypair = cluster_info.keypair().clone();
-
         debug!("generating authentication token");
-        let (access_token, refresh_token) = timeout(
+        let (access_token, mut refresh_token) = timeout(
             *connection_timeout,
             generate_auth_tokens(&mut auth_client, &keypair),
         )
@@ -229,6 +249,7 @@ impl BlockEngineStage {
             block_engine_client,
             &packet_tx,
             block_engine_config.trust_packets,
+            maybe_block_engine_config,
             &verified_packet_tx,
             &exit,
             &block_builder_fee_info,
@@ -237,6 +258,7 @@ impl BlockEngineStage {
             refresh_token,
             connection_timeout,
             keypair,
+            cluster_info,
         )
         .await
     }
@@ -246,14 +268,16 @@ impl BlockEngineStage {
         mut client: BlockEngineValidatorClient<InterceptedService<Channel, AuthInterceptor>>,
         packet_tx: &Sender<PacketBatch>,
         trust_packets: bool,
+        maybe_block_engine_config: &Arc<std::sync::RwLock<Option<BlockEngineConfig>>>,
         verified_packet_tx: &Sender<(Vec<PacketBatch>, Option<SigverifyTracerPacketStats>)>,
         exit: &Arc<AtomicBool>,
         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
-        auth_client: AuthServiceClient<Channel>,
+        mut auth_client: AuthServiceClient<Channel>,
         access_token: Arc<Mutex<Token>>,
-        refresh_token: Token,
+        mut refresh_token: Token,
         connection_timeout: &Duration,
-        keypair: Arc<Keypair>,
+        keypair: Keypair,
+        cluster_info: &Arc<ClusterInfo>,
     ) -> crate::proxy::Result<()> {
         let subscribe_packets_stream = timeout(
             *connection_timeout,
@@ -295,6 +319,7 @@ impl BlockEngineStage {
             bundle_tx,
             packet_tx,
             trust_packets,
+            maybe_block_engine_config,
             verified_packet_tx,
             exit,
             block_builder_fee_info,
@@ -302,6 +327,7 @@ impl BlockEngineStage {
             access_token,
             refresh_token,
             keypair,
+            cluster_info,
             connection_timeout,
         )
         .await
@@ -316,18 +342,24 @@ impl BlockEngineStage {
         bundle_tx: &Sender<Vec<PacketBundle>>,
         packet_tx: &Sender<PacketBatch>,
         trust_packets: bool,
+        maybe_block_engine_config: &Arc<std::sync::RwLock<Option<BlockEngineConfig>>>,
         verified_packet_tx: &Sender<(Vec<PacketBatch>, Option<SigverifyTracerPacketStats>)>,
         exit: &Arc<AtomicBool>,
         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
-        auth_client: AuthServiceClient<Channel>,
+        mut auth_client: AuthServiceClient<Channel>,
         access_token: Arc<Mutex<Token>>,
-        refresh_token: Token,
-        keypair: Arc<Keypair>,
+        mut refresh_token: Token,
+        keypair: Keypair,
+        cluster_info: &Arc<ClusterInfo>,
         connection_timeout: &Duration,
     ) -> crate::proxy::Result<()> {
         const METRICS_TICK: Duration = Duration::from_secs(1);
         const MAINTENANCE_TICK: Duration = Duration::from_secs(10 * 60);
-        const AUTH_REFRESH_LOOKAHEAD: u64 = 300;
+        // Lookahead by Maintenance Tick plus 25%
+        const AUTH_REFRESH_LOOKAHEAD: u64 = MAINTENANCE_TICK
+            .as_secs()
+            .saturating_mul(5)
+            .saturating_div(4);
 
         let mut block_engine_stats = BlockEngineStageStats::default();
         let mut metrics_tick = interval(METRICS_TICK);
@@ -349,17 +381,33 @@ impl BlockEngineStage {
                     block_engine_stats = BlockEngineStageStats::default();
                 }
                 _ = maintenance_tick.tick() => {
-                    // TODO (LB): add timeout here
-                    let block_builder_info = client.get_block_builder_fee_info(BlockBuilderFeeInfoRequest{}).await?.into_inner();
+
+                    if *cluster_info.id() != keypair.pubkey() {
+                        return ProxyError::AuthenticationConnectionError("Validator ID Changed");
+                    }
+
+                    // ToDo (JL): Check if block engine config has changed
+                    let block_engine_config = maybe_block_engine_config.read().unwrap_or_else(return ProxyError::BlockEngineConnectionError("Block Engine Config set to None"));
+                    if  block_engine_config != BlockEngineConfig {
+
+                    } {
+
+                    }
+
+                    let block_builder_info = timeout(
+                        *connection_timeout,
+                        client.get_block_builder_fee_info(BlockBuilderFeeInfoRequest{})
+                    )
+                    .await
+                    .map_err(|e| ProxyError::MethodTimeout("get_block_builder_fee_info".to_string()))?
+                    .map_err(|e| ProxyError::MethodError(e.to_string()))?
+                    .into_inner();
+
                     let mut bb_fee = block_builder_fee_info.lock().unwrap();
                     bb_fee.block_builder_commission = block_builder_info.commission;
                     bb_fee.block_builder = Pubkey::from_str(&block_builder_info.pubkey).unwrap_or(bb_fee.block_builder);
 
-                    // TODO (LB): check to see if need to refresh before next maintenance_tick
-                    // if Utc::now().timestamp()
-
-                    // TODO (LB): check auth token expiration + refresh if needed
-                    maybe_refresh_access_token(&auth_client, &access_token, refresh_token, connection_timeout, &AUTH_REFRESH_LOOKAHEAD).await?;
+                    maybe_refresh_auth_tokens(&mut auth_client, &access_token, &mut refresh_token, connection_timeout, &AUTH_REFRESH_LOOKAHEAD).await?;
                 }
             }
         }

@@ -43,195 +43,6 @@ impl Interceptor for AuthInterceptor {
     }
 }
 
-/// Contains collection of utility functions responsible for generating and refreshing new tokens.
-pub(crate) mod token_manager {
-    use {super::*, crate::proxy::ProxyError, tonic::transport::Endpoint};
-
-    /// Control loop responsible for making sure access and refresh tokens are updated.
-    pub(crate) async fn auth_tokens_update_loop(
-        auth_service_endpoint: Endpoint,
-        access_token: Arc<Mutex<Token>>,
-        cluster_info: Arc<ClusterInfo>,
-        exit: Arc<AtomicBool>,
-    ) {
-        const RETRY_INTERVAL: Duration = Duration::from_secs(5);
-        const SLEEP_INTERVAL: Duration = Duration::from_secs(60);
-
-        let mut num_refresh_loop_errors: u64 = 0;
-        let mut num_connect_errors: u64 = 0;
-        while !exit.load(Ordering::Relaxed) {
-            sleep(RETRY_INTERVAL).await;
-
-            match auth_service_endpoint.connect().await {
-                Ok(channel) => {
-                    if let Err(e) = auth_tokens_update_loop_helper(
-                        AuthServiceClient::new(channel),
-                        auth_service_endpoint.uri().to_string(),
-                        (access_token.clone(), Token::default()),
-                        cluster_info.clone(),
-                        SLEEP_INTERVAL,
-                        exit.clone(),
-                    )
-                    .await
-                    {
-                        num_refresh_loop_errors += 1;
-                        datapoint_error!(
-                            "auth_tokens_update_loop-refresh_loop_error",
-                            ("url", auth_service_endpoint.uri().to_string(), String),
-                            ("count", num_refresh_loop_errors, i64),
-                            ("error", e.to_string(), String)
-                        );
-                    }
-                }
-                Err(e) => {
-                    num_connect_errors += 1;
-                    datapoint_error!(
-                        "auth_tokens_update_loop-refresh_connect_error",
-                        ("url", auth_service_endpoint.uri().to_string(), String),
-                        ("count", num_connect_errors, i64),
-                        ("error", e.to_string(), String)
-                    );
-                }
-            }
-        }
-    }
-
-    /// Responsible for keeping generating and refreshing the access token.
-    async fn auth_tokens_update_loop_helper(
-        mut auth_service_client: AuthServiceClient<Channel>,
-        url: String,
-        (access_token, mut refresh_token): (Arc<Mutex<Token>>, Token),
-        cluster_info: Arc<ClusterInfo>,
-        sleep_interval: Duration,
-        exit: Arc<AtomicBool>,
-    ) -> crate::proxy::Result<()> {
-        const REFRESH_WITHIN_SECS: i64 = 300;
-        let mut num_full_refreshes = 0;
-        let mut num_refresh_access_token = 0;
-
-        while !exit.load(Ordering::Relaxed) {
-            let access_token_expiry: i64 = access_token
-                .lock()
-                .unwrap()
-                .expires_at_utc
-                .as_ref()
-                .map(|ts| ts.seconds)
-                .unwrap_or_default();
-            let refresh_token_expiry = refresh_token
-                .expires_at_utc
-                .as_ref()
-                .map(|ts| ts.seconds)
-                .unwrap_or_default();
-
-            let now = Utc::now().timestamp();
-
-            let should_refresh_access = access_token_expiry.checked_sub(now).ok_or_else(|| {
-                ProxyError::InvalidData("Received invalid access_token expiration".to_string())
-            })? <= REFRESH_WITHIN_SECS;
-            let should_generate_new_tokens =
-                refresh_token_expiry.checked_sub(now).ok_or_else(|| {
-                    ProxyError::InvalidData("Received invalid refresh_token expiration".to_string())
-                })? <= REFRESH_WITHIN_SECS;
-
-            match (should_refresh_access, should_generate_new_tokens) {
-                // Generate new tokens if the refresh_token is close to being expired.
-                (_, true) => {
-                    let kp = cluster_info.keypair().clone();
-
-                    let (new_access_token, new_refresh_token) =
-                        generate_auth_tokens(&mut auth_service_client, kp.as_ref()).await?;
-
-                    *access_token.lock().unwrap() = new_access_token.clone();
-                    refresh_token = new_refresh_token;
-
-                    num_full_refreshes += 1;
-                    datapoint_info!(
-                        "auth_tokens_update_loop-tokens_generated",
-                        ("url", url, String),
-                        ("count", num_full_refreshes, i64),
-                    );
-                }
-                // Invoke the refresh_access_token method if the access_token is close to being expired.
-                (true, _) => {
-                    let new_access_token =
-                        refresh_access_token(&mut auth_service_client, refresh_token.clone())
-                            .await?;
-                    *access_token.lock().unwrap() = new_access_token;
-
-                    num_refresh_access_token += 1;
-                    datapoint_info!(
-                        "auth_tokens_update_loop-refresh_access_token",
-                        ("url", url, String),
-                        ("count", num_refresh_access_token, i64),
-                    );
-                }
-                // Sleep and do nothing if neither token is close to expired,
-                (false, false) => sleep(sleep_interval).await,
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Invokes the refresh_access_token gRPC method.
-    /// Returns a new access_token.
-    async fn refresh_access_token(
-        auth_service_client: &mut AuthServiceClient<Channel>,
-        refresh_token: Token,
-    ) -> crate::proxy::Result<Token> {
-        match auth_service_client
-            .refresh_access_token(RefreshAccessTokenRequest {
-                refresh_token: refresh_token.value,
-            })
-            .await
-        {
-            Ok(resp) => get_validated_token(resp.into_inner().access_token),
-            Err(e) => Err(ProxyError::GrpcError(e)),
-        }
-    }
-
-    /// Generates an auth challenge then generates and returns validated auth tokens.
-    async fn generate_auth_tokens(
-        auth_service_client: &mut AuthServiceClient<Channel>,
-        // used to sign challenges
-        keypair: &Keypair,
-    ) -> crate::proxy::Result<(
-        Token, /* access_token */
-        Token, /* refresh_token */
-    )> {
-        let challenge_response = auth_service_client
-            .generate_auth_challenge(GenerateAuthChallengeRequest {
-                role: Role::Validator as i32,
-                pubkey: keypair.pubkey().as_ref().to_vec(),
-            })
-            .await?;
-
-        let formatted_challenge = format!(
-            "{}-{}",
-            keypair.pubkey(),
-            challenge_response.into_inner().challenge
-        );
-        let signed_challenge = keypair
-            .sign_message(formatted_challenge.as_bytes())
-            .as_ref()
-            .to_vec();
-
-        let auth_tokens = auth_service_client
-            .generate_auth_tokens(GenerateAuthTokensRequest {
-                challenge: formatted_challenge,
-                client_pubkey: keypair.pubkey().as_ref().to_vec(),
-                signed_challenge,
-            })
-            .await?;
-
-        let inner = auth_tokens.into_inner();
-        let access_token = get_validated_token(inner.access_token)?;
-        let refresh_token = get_validated_token(inner.refresh_token)?;
-
-        Ok((access_token, refresh_token))
-    }
-}
-
 /// Generates an auth challenge then generates and returns validated auth tokens.
 pub async fn generate_auth_tokens(
     auth_service_client: &mut AuthServiceClient<Channel>,
@@ -284,15 +95,15 @@ pub async fn generate_auth_tokens(
 }
 
 /// Tries to refresh the access token or run full-reauth if needed.
-/// If runs full refresh, returns the new refresh token.
 /// This method writes to access_token if refresh is done.
-pub async fn maybe_refresh_access_token(
+/// It overwrites the refresh token if full-reauth is run.
+pub async fn maybe_refresh_auth_tokens(
     auth_service_client: &mut AuthServiceClient<Channel>,
     access_token: &Arc<Mutex<Token>>,
-    refresh_token: &Token,
+    refresh_token: &mut Token,
     connection_timeout: Duration,
     auth_refresh_lookahead: u64,
-) -> crate::proxy::Result<Option<Token>> {
+) -> crate::proxy::Result<()> {
     let access_token_expiry: u64 = access_token
         .lock()
         .unwrap()
@@ -314,43 +125,35 @@ pub async fn maybe_refresh_access_token(
         refresh_token_expiry.checked_sub(now).unwrap_or_default() <= auth_refresh_lookahead;
 
     if should_generate_new_tokens {
-    } else if should_refresh_access {
-    }
+        let kp = cluster_info.keypair().clone();
 
-    // match (should_refresh_access, should_generate_new_tokens) {
-    //     // Generate new tokens if the refresh_token is close to being expired.
-    //     (_, true) => {
-    //         let kp = cluster_info.keypair().clone();
-    //
-    //         let (new_access_token, new_refresh_token) =
-    //             generate_auth_tokens(&mut auth_service_client, kp.as_ref()).await?;
-    //
-    //         *access_token.lock().unwrap() = new_access_token.clone();
-    //         refresh_token = new_refresh_token;
-    //
-    //         num_full_refreshes += 1;
-    //         datapoint_info!(
-    //                     "auth_tokens_update_loop-tokens_generated",
-    //                     ("url", url, String),
-    //                     ("count", num_full_refreshes, i64),
-    //                 );
-    //     }
-    //     // Invoke the refresh_access_token method if the access_token is close to being expired.
-    //     (true, _) => {
-    //         let new_access_token =
-    //             refresh_access_token(&mut auth_service_client, refresh_token.clone())
-    //                 .await?;
-    //         *access_token.lock().unwrap() = new_access_token;
-    //
-    //         num_refresh_access_token += 1;
-    //         datapoint_info!(
-    //                     "auth_tokens_update_loop-refresh_access_token",
-    //                     ("url", url, String),
-    //                     ("count", num_refresh_access_token, i64),
-    //                 );
-    //     }
-    //     // Sleep and do nothing if neither token is close to expired,
-    //     (false, false) => sleep(sleep_interval).await,
+        let (new_access_token, new_refresh_token) =
+            generate_auth_tokens(auth_service_client, kp.as_ref()).await?;
+
+        *access_token.lock().unwrap() = new_access_token.clone();
+        *refresh_token = new_refresh_token.clone();
+
+        num_full_refreshes += 1;
+        datapoint_info!(
+            "auth_tokens_update_loop-tokens_generated",
+            ("url", url, String),
+            ("count", num_full_refreshes, i64),
+        );
+
+        Ok(())
+    } else if should_refresh_access {
+        let new_access_token =
+            refresh_access_token(auth_service_client, refresh_token.clone()).await?;
+        *access_token.lock().unwrap() = new_access_token;
+
+        num_refresh_access_token += 1;
+        datapoint_info!(
+            "auth_tokens_update_loop-refresh_access_token",
+            ("url", url, String),
+            ("count", num_refresh_access_token, i64),
+        );
+        Ok(())
+    }
 }
 
 pub async fn refresh_access_token(

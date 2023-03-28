@@ -368,7 +368,7 @@ pub struct Validator {
     snapshot_packager_service: Option<SnapshotPackagerService>,
     poh_recorder: Arc<RwLock<PohRecorder>>,
     poh_service: PohService,
-    tpu: Tpu,
+    pub tpu: Tpu,
     tvu: Tvu,
     ip_echo_server: Option<solana_net_utils::IpEchoServer>,
     pub cluster_info: Arc<ClusterInfo>,
