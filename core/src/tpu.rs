@@ -72,8 +72,7 @@ pub struct Tpu {
     sigverify_stage: SigVerifyStage,
     vote_sigverify_stage: SigVerifyStage,
     maybe_relayer_stage: Option<RelayerStage>,
-    pub maybe_block_engine_stage: Option<BlockEngineStage>,
-    pub maybe_block_engine_config: Arc<RwLock<Option<BlockEngineConfig>>>,
+    maybe_block_engine_stage: Option<BlockEngineStage>,
     maybe_fetch_stage_manager: Option<FetchStageManager>,
     banking_stage: BankingStage,
     cluster_info_vote_listener: ClusterInfoVoteListener,
@@ -240,22 +239,17 @@ impl Tpu {
         }));
 
         let (bundle_sender, bundle_receiver) = unbounded();
-        let maybe_block_engine_config = Arc::new(RwLock::new(maybe_block_engine_config));
-        let maybe_block_engine_stage =
-            *maybe_block_engine_config
-                .read()
-                .unwrap()
-                .map(|block_engine_config| {
-                    BlockEngineStage::new(
-                        maybe_block_engine_config,
-                        bundle_sender,
-                        cluster_info.clone(),
-                        packet_sender.clone(),
-                        verified_sender.clone(),
-                        exit.clone(),
-                        &block_builder_fee_info,
-                    )
-                });
+        let maybe_block_engine_stage = maybe_block_engine_config.map(|block_engine_config| {
+            BlockEngineStage::new(
+                block_engine_config,
+                bundle_sender,
+                cluster_info.clone(),
+                packet_sender.clone(),
+                verified_sender.clone(),
+                exit.clone(),
+                &block_builder_fee_info,
+            )
+        });
 
         let (heartbeat_tx, heartbeat_rx) = unbounded();
         let maybe_fetch_stage_manager = maybe_relayer_config.as_ref().map(|_| {
@@ -352,7 +346,6 @@ impl Tpu {
             sigverify_stage,
             vote_sigverify_stage,
             maybe_block_engine_stage,
-            maybe_block_engine_config,
             maybe_relayer_stage,
             maybe_fetch_stage_manager,
             banking_stage,

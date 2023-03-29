@@ -86,22 +86,13 @@ pub struct BlockEngineConfig {
     pub trust_packets: bool,
 }
 
-impl PartialEq for BlockEngineConfig {
-    fn eq(&self, other: &Self) -> bool {
-        self.auth_service_endpoint.uri() == other.auth_service_endpoint.uri()
-            && self.backend_endpoint.uri() == other.backend_endpoint.uri()
-            && self.trust_packets == other.trust_packets
-    }
-}
-
 pub struct BlockEngineStage {
-    maybe_block_engine_config: Arc<std::sync::RwLock<Option<BlockEngineConfig>>>,
     t_hdls: Vec<JoinHandle<()>>,
 }
 
 impl BlockEngineStage {
     pub fn new(
-        maybe_block_engine_config: Arc<std::sync::RwLock<Option<BlockEngineConfig>>>,
+        block_engine_config: BlockEngineConfig,
         // Channel that bundles get piped through.
         bundle_tx: Sender<Vec<PacketBundle>>,
         // The keypair stored here is used to sign auth challenges.
@@ -123,7 +114,7 @@ impl BlockEngineStage {
                     .build()
                     .unwrap();
                 rt.block_on(Self::start(
-                    maybe_block_engine_config.clone(),
+                    block_engine_config,
                     cluster_info,
                     bundle_tx,
                     packet_tx,
@@ -135,7 +126,6 @@ impl BlockEngineStage {
             .unwrap();
 
         Self {
-            maybe_block_engine_config,
             t_hdls: vec![thread],
         }
     }
@@ -149,7 +139,7 @@ impl BlockEngineStage {
 
     #[allow(clippy::too_many_arguments)]
     async fn start(
-        maybe_block_engine_config: Arc<std::sync::RwLock<Option<BlockEngineConfig>>>,
+        block_engine_config: BlockEngineConfig,
         cluster_info: Arc<ClusterInfo>,
         bundle_tx: Sender<Vec<PacketBundle>>,
         packet_tx: Sender<PacketBatch>,
@@ -163,7 +153,7 @@ impl BlockEngineStage {
 
         while !exit.load(Ordering::Relaxed) {
             match Self::connect_auth_and_stream(
-                &maybe_block_engine_config,
+                &block_engine_config,
                 &cluster_info,
                 &bundle_tx,
                 &packet_tx,
@@ -187,7 +177,7 @@ impl BlockEngineStage {
     }
 
     async fn connect_auth_and_stream(
-        maybe_block_engine_config: &Arc<std::sync::RwLock<Option<BlockEngineConfig>>>,
+        block_engine_config: &BlockEngineConfig,
         cluster_info: &Arc<ClusterInfo>,
         bundle_tx: &Sender<Vec<PacketBundle>>,
         packet_tx: &Sender<PacketBatch>,
@@ -197,11 +187,6 @@ impl BlockEngineStage {
         connection_timeout: &Duration,
     ) -> crate::proxy::Result<()> {
         // Get Configs here in case they have changed at runtime
-        let block_engine_config = maybe_block_engine_config
-            .read()
-            .unwrap()
-            .clone()
-            .expect("Starting Block Engine with No Config");
         let keypair = *cluster_info.keypair().clone();
 
         debug!(
@@ -249,7 +234,6 @@ impl BlockEngineStage {
             block_engine_client,
             &packet_tx,
             block_engine_config.trust_packets,
-            maybe_block_engine_config,
             &verified_packet_tx,
             &exit,
             &block_builder_fee_info,
@@ -268,7 +252,6 @@ impl BlockEngineStage {
         mut client: BlockEngineValidatorClient<InterceptedService<Channel, AuthInterceptor>>,
         packet_tx: &Sender<PacketBatch>,
         trust_packets: bool,
-        maybe_block_engine_config: &Arc<std::sync::RwLock<Option<BlockEngineConfig>>>,
         verified_packet_tx: &Sender<(Vec<PacketBatch>, Option<SigverifyTracerPacketStats>)>,
         exit: &Arc<AtomicBool>,
         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
@@ -319,7 +302,6 @@ impl BlockEngineStage {
             bundle_tx,
             packet_tx,
             trust_packets,
-            maybe_block_engine_config,
             verified_packet_tx,
             exit,
             block_builder_fee_info,
@@ -342,7 +324,6 @@ impl BlockEngineStage {
         bundle_tx: &Sender<Vec<PacketBundle>>,
         packet_tx: &Sender<PacketBatch>,
         trust_packets: bool,
-        maybe_block_engine_config: &Arc<std::sync::RwLock<Option<BlockEngineConfig>>>,
         verified_packet_tx: &Sender<(Vec<PacketBatch>, Option<SigverifyTracerPacketStats>)>,
         exit: &Arc<AtomicBool>,
         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
@@ -384,14 +365,6 @@ impl BlockEngineStage {
 
                     if *cluster_info.id() != keypair.pubkey() {
                         return ProxyError::AuthenticationConnectionError("Validator ID Changed");
-                    }
-
-                    // ToDo (JL): Check if block engine config has changed
-                    let block_engine_config = maybe_block_engine_config.read().unwrap_or_else(return ProxyError::BlockEngineConnectionError("Block Engine Config set to None"));
-                    if  block_engine_config != BlockEngineConfig {
-
-                    } {
-
                     }
 
                     let block_builder_info = timeout(
