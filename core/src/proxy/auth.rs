@@ -101,8 +101,11 @@ pub async fn maybe_refresh_auth_tokens(
     auth_service_client: &mut AuthServiceClient<Channel>,
     access_token: &Arc<Mutex<Token>>,
     refresh_token: &mut Token,
-    connection_timeout: Duration,
+    cluster_info: &Arc<ClusterInfo>,
+    connection_timeout: &Duration,
     auth_refresh_lookahead: u64,
+    mut num_full_refreshes: u64,
+    mut num_refresh_access_token: u64,
 ) -> crate::proxy::Result<()> {
     let access_token_expiry: u64 = access_token
         .lock()
@@ -127,8 +130,13 @@ pub async fn maybe_refresh_auth_tokens(
     if should_generate_new_tokens {
         let kp = cluster_info.keypair().clone();
 
-        let (new_access_token, new_refresh_token) =
-            generate_auth_tokens(auth_service_client, kp.as_ref()).await?;
+        let (new_access_token, new_refresh_token) = timeout(
+            *connection_timeout,
+            generate_auth_tokens(auth_service_client, kp.as_ref()),
+        )
+        .await
+        .map_err(|e| ProxyError::MethodTimeout("refresh_access_token".to_string()))?
+        .map_err(|e| ProxyError::MethodError(e.to_string()))?;
 
         *access_token.lock().unwrap() = new_access_token.clone();
         *refresh_token = new_refresh_token.clone();
@@ -136,24 +144,34 @@ pub async fn maybe_refresh_auth_tokens(
         num_full_refreshes += 1;
         datapoint_info!(
             "auth_tokens_update_loop-tokens_generated",
-            ("url", url, String),
+            // ("url", auth_service_endpoint.uri().to_string(), String),
+            ("url", "todo (JL): fix uri".to_string(), String),
             ("count", num_full_refreshes, i64),
         );
 
-        Ok(())
+        return Ok(());
     } else if should_refresh_access {
-        let new_access_token =
-            refresh_access_token(auth_service_client, refresh_token.clone()).await?;
+        let new_access_token = timeout(
+            *connection_timeout,
+            refresh_access_token(auth_service_client, refresh_token.clone()),
+        )
+        .await
+        .map_err(|e| ProxyError::MethodTimeout("refresh_access_token".to_string()))?
+        .map_err(|e| ProxyError::MethodError(e.to_string()))?;
+
         *access_token.lock().unwrap() = new_access_token;
 
         num_refresh_access_token += 1;
         datapoint_info!(
             "auth_tokens_update_loop-refresh_access_token",
-            ("url", url, String),
+            // ("url", url, String),
+            ("url", "todo (JL): fix uri".to_string(), String),
             ("count", num_refresh_access_token, i64),
         );
-        Ok(())
+        return Ok(());
     }
+
+    Ok(())
 }
 
 pub async fn refresh_access_token(

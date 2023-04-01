@@ -3340,7 +3340,9 @@ pub fn main() {
             bank_forks: validator.bank_forks.clone(),
             cluster_info: validator.cluster_info.clone(),
             vote_account,
-            maybe_block_engine_config: validator.tpu.maybe_block_engine_config.clone(),
+            // ToDo (JL):
+            // maybe_block_engine_config: validator.tpu.maybe_block_engine_config.clone(),
+            // maybe_relayer_config:
         });
 
     if let Some(filename) = init_complete_file {

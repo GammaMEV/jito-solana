@@ -3,8 +3,6 @@
 //! The Block Engine is responsible for the following:
 //! - Acts as a system that sends high profit bundles and transactions to a validator.
 //! - Sends transactions and bundles to the validator.
-
-use futures_util::TryFutureExt;
 use tokio::sync::RwLock;
 use {
     crate::{
@@ -18,6 +16,7 @@ use {
     },
     chrono::Utc,
     crossbeam_channel::Sender,
+    futures_util::TryFutureExt,
     jito_protos::proto::{
         auth::{auth_service_client::AuthServiceClient, Token},
         block_engine::{
@@ -27,9 +26,11 @@ use {
     },
     solana_gossip::cluster_info::ClusterInfo,
     solana_perf::packet::PacketBatch,
-    solana_sdk::{pubkey::Pubkey, saturating_add_assign, signer::keypair::Keypair},
+    solana_sdk::{
+        pubkey::Pubkey, saturating_add_assign, signature::Signer, signer::keypair::Keypair,
+    },
     std::{
-        cmp::max,
+        cmp::min,
         str::FromStr,
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -74,7 +75,7 @@ pub struct BlockBuilderFeeInfo {
     pub block_builder_commission: u64,
 }
 
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Debug)]
 pub struct BlockEngineConfig {
     /// Address to the external auth-service responsible for generating access tokens.
     pub auth_service_endpoint: Endpoint,
@@ -150,6 +151,7 @@ impl BlockEngineStage {
         const MAX_BACKOFF_S: u64 = 10;
         const CONNECTION_TIMEOUT: Duration = Duration::from_secs(CONNECTION_TIMEOUT_S);
         let mut backoff_sec: u64 = 1;
+        let mut error_count: u64 = 0;
 
         while !exit.load(Ordering::Relaxed) {
             match Self::connect_auth_and_stream(
@@ -168,8 +170,14 @@ impl BlockEngineStage {
                     backoff_sec = 0;
                 }
                 Err(e) => {
-                    error!("proxy error: {:?}", e);
-                    backoff_sec = max(backoff_sec + 1, MAX_BACKOFF_S);
+                    error_count += 1;
+                    error!("block engine stage proxy error: {:?}", e);
+                    datapoint_error!(
+                        "block_engine_stage-proxy_error",
+                        ("count", error_count, i64),
+                        ("error", e.to_string(), String),
+                    );
+                    backoff_sec = min(backoff_sec + 1, MAX_BACKOFF_S);
                     sleep(Duration::from_secs(backoff_sec)).await;
                 }
             }
@@ -187,7 +195,7 @@ impl BlockEngineStage {
         connection_timeout: &Duration,
     ) -> crate::proxy::Result<()> {
         // Get Configs here in case they have changed at runtime
-        let keypair = *cluster_info.keypair().clone();
+        let keypair = cluster_info.keypair().clone();
 
         debug!(
             "connecting to auth: {:?}",
@@ -259,7 +267,7 @@ impl BlockEngineStage {
         access_token: Arc<Mutex<Token>>,
         mut refresh_token: Token,
         connection_timeout: &Duration,
-        keypair: Keypair,
+        keypair: Arc<Keypair>,
         cluster_info: &Arc<ClusterInfo>,
     ) -> crate::proxy::Result<()> {
         let subscribe_packets_stream = timeout(
@@ -330,7 +338,7 @@ impl BlockEngineStage {
         mut auth_client: AuthServiceClient<Channel>,
         access_token: Arc<Mutex<Token>>,
         mut refresh_token: Token,
-        keypair: Keypair,
+        keypair: Arc<Keypair>,
         cluster_info: &Arc<ClusterInfo>,
         connection_timeout: &Duration,
     ) -> crate::proxy::Result<()> {
@@ -342,6 +350,8 @@ impl BlockEngineStage {
             .saturating_mul(5)
             .saturating_div(4);
 
+        let mut num_full_refreshes: u64 = 0;
+        let mut num_refresh_access_token: u64 = 0;
         let mut block_engine_stats = BlockEngineStageStats::default();
         let mut metrics_tick = interval(METRICS_TICK);
         let mut maintenance_tick = interval(MAINTENANCE_TICK);
@@ -363,8 +373,8 @@ impl BlockEngineStage {
                 }
                 _ = maintenance_tick.tick() => {
 
-                    if *cluster_info.id() != keypair.pubkey() {
-                        return ProxyError::AuthenticationConnectionError("Validator ID Changed");
+                    if cluster_info.id() != keypair.pubkey() {
+                        return Err(ProxyError::AuthenticationConnectionError("Validator ID Changed".to_string()));
                     }
 
                     let block_builder_info = timeout(
@@ -380,7 +390,7 @@ impl BlockEngineStage {
                     bb_fee.block_builder_commission = block_builder_info.commission;
                     bb_fee.block_builder = Pubkey::from_str(&block_builder_info.pubkey).unwrap_or(bb_fee.block_builder);
 
-                    maybe_refresh_auth_tokens(&mut auth_client, &access_token, &mut refresh_token, connection_timeout, &AUTH_REFRESH_LOOKAHEAD).await?;
+                    maybe_refresh_auth_tokens(&mut auth_client, &access_token, &mut refresh_token, &cluster_info, &connection_timeout, AUTH_REFRESH_LOOKAHEAD, num_full_refreshes, num_refresh_access_token).await?;
                 }
             }
         }

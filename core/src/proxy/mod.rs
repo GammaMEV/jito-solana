@@ -74,6 +74,15 @@ pub enum ProxyError {
     #[error("BlockEngineConnectionError: {0:?}")]
     BlockEngineConnectionError(String),
 
+    #[error("RelayerConnectionTimeout")]
+    RelayerConnectionTimeout,
+
+    #[error("RelayerTimeout")]
+    RelayerEngineTimeout,
+
+    #[error("RelayerConnectionError: {0:?}")]
+    RelayerConnectionError(String),
+
     #[error("AuthenticationError: {0:?}")]
     AuthenticationError(String),
 
