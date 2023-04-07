@@ -7,8 +7,7 @@ use {
     log::*,
     serde::{de::Deserializer, Deserialize, Serialize},
     solana_core::{
-        consensus::Tower, proxy::block_engine_stage::BlockEngineConfig,
-        tower_storage::TowerStorage, validator::ValidatorStartProgress,
+        consensus::Tower, tower_storage::TowerStorage, validator::ValidatorStartProgress,
     },
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_runtime::bank_forks::BankForks,
@@ -36,7 +35,7 @@ pub struct AdminRpcRequestMetadataPostInit {
     pub vote_account: Pubkey,
     // ToDo (JL):
     // pub maybe_block_engine_config: Arc<RwLock<Option<BlockEngineConfig>>>,
-    // pub maybe relayer_config:
+    // pub maybe_relayer_config: Arc<RwLock<Option<RelayerConfig>>>
 }
 
 #[derive(Clone)]

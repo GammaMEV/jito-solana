@@ -13,9 +13,7 @@ use {
         },
         sigverify::SigverifyTracerPacketStats,
     },
-    chrono::Utc,
     crossbeam_channel::Sender,
-    futures_util::TryFutureExt,
     jito_protos::proto::{
         auth::{auth_service_client::AuthServiceClient, Token},
         block_engine::{
@@ -38,10 +36,7 @@ use {
         thread::{self, Builder, JoinHandle},
         time::Duration,
     },
-    tokio::{
-        sync::RwLock,
-        time::{interval, sleep, timeout},
-    },
+    tokio::time::{interval, sleep, timeout},
     tonic::{
         codegen::InterceptedService,
         transport::{Channel, Endpoint},
@@ -219,7 +214,7 @@ impl BlockEngineStage {
             generate_auth_tokens(&mut auth_client, &keypair),
         )
         .await
-        .map_err(|e| ProxyError::AuthenticationTimeout)??;
+        .map_err(|_| ProxyError::AuthenticationTimeout)??;
 
         debug!(
             "connecting to block engine: {:?}",
@@ -243,13 +238,13 @@ impl BlockEngineStage {
             &bundle_tx,
             block_engine_client,
             &packet_tx,
-            block_engine_config.trust_packets,
+            block_engine_config,
             &verified_packet_tx,
             &exit,
             &block_builder_fee_info,
             auth_client,
             access_token,
-            refresh_token,
+            &mut refresh_token,
             connection_timeout,
             keypair,
             cluster_info,
@@ -261,13 +256,13 @@ impl BlockEngineStage {
         bundle_tx: &Sender<Vec<PacketBundle>>,
         mut client: BlockEngineValidatorClient<InterceptedService<Channel, AuthInterceptor>>,
         packet_tx: &Sender<PacketBatch>,
-        trust_packets: bool,
+        block_engine_config: &BlockEngineConfig,
         verified_packet_tx: &Sender<(Vec<PacketBatch>, Option<SigverifyTracerPacketStats>)>,
         exit: &Arc<AtomicBool>,
         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
         mut auth_client: AuthServiceClient<Channel>,
         access_token: Arc<Mutex<Token>>,
-        mut refresh_token: Token,
+        refresh_token: &mut Token,
         connection_timeout: &Duration,
         keypair: Arc<Keypair>,
         cluster_info: &Arc<ClusterInfo>,
@@ -277,7 +272,7 @@ impl BlockEngineStage {
             client.subscribe_packets(block_engine::SubscribePacketsRequest {}),
         )
         .await
-        .map_err(|e| ProxyError::MethodTimeout("subscribe_packets".to_string()))?
+        .map_err(|_| ProxyError::MethodTimeout("subscribe_packets".to_string()))?
         .map_err(|e| ProxyError::MethodError(e.to_string()))?
         .into_inner();
 
@@ -286,7 +281,7 @@ impl BlockEngineStage {
             client.subscribe_bundles(block_engine::SubscribeBundlesRequest {}),
         )
         .await
-        .map_err(|e| ProxyError::MethodTimeout("subscribe_bundles".to_string()))?
+        .map_err(|_| ProxyError::MethodTimeout("subscribe_bundles".to_string()))?
         .map_err(|e| ProxyError::MethodError(e.to_string()))?
         .into_inner();
 
@@ -295,7 +290,7 @@ impl BlockEngineStage {
             client.get_block_builder_fee_info(BlockBuilderFeeInfoRequest {}),
         )
         .await
-        .map_err(|e| ProxyError::MethodTimeout("get_block_builder_fee_info".to_string()))?
+        .map_err(|_| ProxyError::MethodTimeout("get_block_builder_fee_info".to_string()))?
         .map_err(|e| ProxyError::MethodError(e.to_string()))?
         .into_inner();
 
@@ -311,7 +306,7 @@ impl BlockEngineStage {
             (subscribe_bundles_stream, subscribe_packets_stream),
             bundle_tx,
             packet_tx,
-            trust_packets,
+            block_engine_config,
             verified_packet_tx,
             exit,
             block_builder_fee_info,
@@ -333,13 +328,13 @@ impl BlockEngineStage {
         ),
         bundle_tx: &Sender<Vec<PacketBundle>>,
         packet_tx: &Sender<PacketBatch>,
-        trust_packets: bool,
+        block_engine_config: &BlockEngineConfig,
         verified_packet_tx: &Sender<(Vec<PacketBatch>, Option<SigverifyTracerPacketStats>)>,
         exit: &Arc<AtomicBool>,
         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
         mut auth_client: AuthServiceClient<Channel>,
         access_token: Arc<Mutex<Token>>,
-        mut refresh_token: Token,
+        refresh_token: &mut Token,
         keypair: Arc<Keypair>,
         cluster_info: &Arc<ClusterInfo>,
         connection_timeout: &Duration,
@@ -364,7 +359,7 @@ impl BlockEngineStage {
             tokio::select! {
                 maybe_msg = packet_stream.message() => {
                     let resp = maybe_msg?.ok_or(ProxyError::GrpcStreamDisconnected)?;
-                    Self::handle_block_engine_packets(resp, packet_tx, verified_packet_tx, trust_packets, &mut block_engine_stats)?;
+                    Self::handle_block_engine_packets(resp, packet_tx, verified_packet_tx, block_engine_config.trust_packets, &mut block_engine_stats)?;
                 }
                 maybe_bundles = bundle_stream.message() => {
                     Self::handle_block_engine_maybe_bundles(maybe_bundles, bundle_tx, &mut block_engine_stats)?;
@@ -384,7 +379,7 @@ impl BlockEngineStage {
                         client.get_block_builder_fee_info(BlockBuilderFeeInfoRequest{})
                     )
                     .await
-                    .map_err(|e| ProxyError::MethodTimeout("get_block_builder_fee_info".to_string()))?
+                    .map_err(|_| ProxyError::MethodTimeout("get_block_builder_fee_info".to_string()))?
                     .map_err(|e| ProxyError::MethodError(e.to_string()))?
                     .into_inner();
 
@@ -392,7 +387,7 @@ impl BlockEngineStage {
                     bb_fee.block_builder_commission = block_builder_info.commission;
                     bb_fee.block_builder = Pubkey::from_str(&block_builder_info.pubkey).unwrap_or(bb_fee.block_builder);
 
-                    maybe_refresh_auth_tokens(&mut auth_client, &access_token, &mut refresh_token, &cluster_info, &connection_timeout, AUTH_REFRESH_LOOKAHEAD, num_full_refreshes, num_refresh_access_token).await?;
+                    maybe_refresh_auth_tokens(&mut auth_client, block_engine_config.auth_service_endpoint.uri().to_string(), &access_token, refresh_token, &cluster_info, connection_timeout, AUTH_REFRESH_LOOKAHEAD, &mut num_full_refreshes, &mut num_refresh_access_token).await?;
                 }
             }
         }

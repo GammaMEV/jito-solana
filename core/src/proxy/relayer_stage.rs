@@ -10,7 +10,6 @@
 
 use {
     crate::{
-        backoff::BackoffStrategy,
         proto_packet_to_packet,
         proxy::{
             auth::{generate_auth_tokens, maybe_refresh_auth_tokens, AuthInterceptor},
@@ -209,7 +208,7 @@ impl RelayerStage {
             generate_auth_tokens(&mut auth_client, &keypair),
         )
         .await
-        .map_err(|e| ProxyError::AuthenticationTimeout)??;
+        .map_err(|_| ProxyError::AuthenticationTimeout)??;
 
         debug!(
             "connecting to relayer: {:?}",
@@ -236,11 +235,11 @@ impl RelayerStage {
             relayer_config.oldest_allowed_heartbeat,
             packet_tx,
             verified_packet_tx,
-            relayer_config.trust_packets,
+            relayer_config,
             &exit,
             auth_client,
             access_token,
-            refresh_token,
+            &mut refresh_token,
             keypair,
             cluster_info,
             connection_timeout,
@@ -255,11 +254,11 @@ impl RelayerStage {
         oldest_allowed_heartbeat: Duration,
         packet_tx: &Sender<PacketBatch>,
         verified_packet_tx: &Sender<(Vec<PacketBatch>, Option<SigverifyTracerPacketStats>)>,
-        trust_packets: bool,
+        relayer_config: &RelayerConfig,
         exit: &Arc<AtomicBool>,
         mut auth_client: AuthServiceClient<Channel>,
         access_token: Arc<Mutex<Token>>,
-        mut refresh_token: Token,
+        refresh_token: &mut Token,
         keypair: Arc<Keypair>,
         cluster_info: &Arc<ClusterInfo>,
         connection_timeout: &Duration,
@@ -298,7 +297,7 @@ impl RelayerStage {
             oldest_allowed_heartbeat,
             packet_stream,
             packet_tx,
-            trust_packets,
+            relayer_config,
             verified_packet_tx,
             exit,
             auth_client,
@@ -318,12 +317,12 @@ impl RelayerStage {
         oldest_allowed_heartbeat: Duration,
         mut packet_stream: Streaming<relayer::SubscribePacketsResponse>,
         packet_tx: &Sender<PacketBatch>,
-        trust_packets: bool,
+        relayer_config: &RelayerConfig,
         verified_packet_tx: &Sender<(Vec<PacketBatch>, Option<SigverifyTracerPacketStats>)>,
         exit: &Arc<AtomicBool>,
         mut auth_client: AuthServiceClient<Channel>,
         access_token: Arc<Mutex<Token>>,
-        mut refresh_token: Token,
+        refresh_token: &mut Token,
         keypair: Arc<Keypair>,
         cluster_info: &Arc<ClusterInfo>,
         connection_timeout: &Duration,
@@ -352,7 +351,7 @@ impl RelayerStage {
             tokio::select! {
                 maybe_msg = packet_stream.message() => {
                     let resp = maybe_msg?.ok_or(ProxyError::GrpcStreamDisconnected)?;
-                    Self::handle_relayer_packets(resp, heartbeat_event, heartbeat_tx, &mut last_heartbeat_ts, packet_tx, trust_packets, verified_packet_tx, &mut relayer_stats)?;
+                    Self::handle_relayer_packets(resp, heartbeat_event, heartbeat_tx, &mut last_heartbeat_ts, packet_tx, relayer_config.trust_packets, verified_packet_tx, &mut relayer_stats)?;
                 }
                 _ = heartbeat_check_interval.tick() => {
                     if last_heartbeat_ts.elapsed() > oldest_allowed_heartbeat {
@@ -368,7 +367,7 @@ impl RelayerStage {
                         return Err(ProxyError::AuthenticationConnectionError("Validator ID Changed".to_string()));
                     }
 
-                    maybe_refresh_auth_tokens(&mut auth_client, &access_token, &mut refresh_token, &cluster_info, &connection_timeout, AUTH_REFRESH_LOOKAHEAD, num_full_refreshes, num_refresh_access_token).await?;
+                    maybe_refresh_auth_tokens(&mut auth_client, relayer_config.auth_service_endpoint.uri().to_string(), &access_token, refresh_token, &cluster_info, connection_timeout, AUTH_REFRESH_LOOKAHEAD, &mut num_full_refreshes, &mut num_refresh_access_token).await?;
                 }
             }
         }
