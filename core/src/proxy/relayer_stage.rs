@@ -8,7 +8,6 @@
 //! - Expected to send heartbeat to validator as watchdog. If watchdog times out, the validator
 //!   disconnects and reverts the TPU and TPU forward settings.
 
-use tokio::time::timeout;
 use {
     crate::{
         backoff::BackoffStrategy,
@@ -40,7 +39,7 @@ use {
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
     },
-    tokio::time::{interval, sleep},
+    tokio::time::{interval, sleep, timeout},
     tonic::{
         codegen::InterceptedService,
         transport::{Channel, Endpoint},
@@ -176,39 +175,6 @@ impl RelayerStage {
                 }
             }
         }
-
-        // let mut wait_count: usize = 0;
-        // let mut stream_error_count: usize = 0;
-        // let mut connect_error_count: usize = 0;
-        // while access_token.lock().unwrap().value.is_empty() {
-        //     if exit.load(Ordering::Relaxed) {
-        //         return;
-        //     }
-        //     wait_count += 1;
-        //     datapoint_info!(
-        //         "relayer_stage-wait_for_auth",
-        //         ("wait_count", wait_count, i64)
-        //     );
-        //     sleep(WAIT_FOR_FIRST_AUTH).await;
-        // }
-        //
-        //     match relayer_endpoint.connect().await {
-        //         Ok(channel) => {
-        //             match Self::start_consuming_relayer_packets(
-        //                 &mut backoff,
-        //                 RelayerClient::with_interceptor(
-        //                     channel,
-        //                     AuthInterceptor::new(access_token.clone()),
-        //                 ),
-        //                 &heartbeat_tx,
-        //                 expected_heartbeat_interval,
-        //                 oldest_allowed_heartbeat,
-        //                 &packet_tx,
-        //                 &verified_packet_tx,
-        //                 trust_packets,
-        //                 &exit,
-        //             )
-        //             .await
     }
 
     async fn connect_auth_and_stream(

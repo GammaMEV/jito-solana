@@ -1,4 +1,3 @@
-use solana_core::proxy::block_engine_stage::BlockEngineConfig;
 use {
     jsonrpc_core::{MetaIoHandler, Metadata, Result},
     jsonrpc_core_client::{transports::ipc, RpcError},
@@ -8,7 +7,8 @@ use {
     log::*,
     serde::{de::Deserializer, Deserialize, Serialize},
     solana_core::{
-        consensus::Tower, tower_storage::TowerStorage, validator::ValidatorStartProgress,
+        consensus::Tower, proxy::block_engine_stage::BlockEngineConfig,
+        tower_storage::TowerStorage, validator::ValidatorStartProgress,
     },
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_runtime::bank_forks::BankForks,

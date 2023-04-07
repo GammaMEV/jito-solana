@@ -3,7 +3,6 @@
 //! The Block Engine is responsible for the following:
 //! - Acts as a system that sends high profit bundles and transactions to a validator.
 //! - Sends transactions and bundles to the validator.
-use tokio::sync::RwLock;
 use {
     crate::{
         packet_bundle::PacketBundle,
@@ -39,7 +38,10 @@ use {
         thread::{self, Builder, JoinHandle},
         time::Duration,
     },
-    tokio::time::{interval, sleep, timeout},
+    tokio::{
+        sync::RwLock,
+        time::{interval, sleep, timeout},
+    },
     tonic::{
         codegen::InterceptedService,
         transport::{Channel, Endpoint},
