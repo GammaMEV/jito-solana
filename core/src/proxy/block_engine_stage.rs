@@ -191,7 +191,7 @@ impl BlockEngineStage {
         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
         connection_timeout: &Duration,
     ) -> crate::proxy::Result<()> {
-        // Get Configs here in case they have changed at runtime
+        // Get a copy of configs here in case they have changed at runtime
         let keypair = cluster_info.keypair().clone();
 
         debug!(
