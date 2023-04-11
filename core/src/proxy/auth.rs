@@ -96,7 +96,9 @@ pub async fn generate_auth_tokens(
 /// It overwrites the refresh token if full-reauth is run.
 pub async fn maybe_refresh_auth_tokens(
     auth_service_client: &mut AuthServiceClient<Channel>,
-    auth_uri: String,
+    datapoint_tokens_generated: &'static str,
+    datapoint_access_refresh: &'static str,
+    auth_uri: &String,
     access_token: &Arc<Mutex<Token>>,
     refresh_token: &mut Token,
     cluster_info: &Arc<ClusterInfo>,
@@ -141,7 +143,7 @@ pub async fn maybe_refresh_auth_tokens(
 
         *num_full_refreshes += 1;
         datapoint_info!(
-            "auth_tokens_update_loop-tokens_generated",
+            datapoint_tokens_generated,
             ("url", auth_uri, String),
             ("count", *num_full_refreshes, i64),
         );
@@ -160,7 +162,7 @@ pub async fn maybe_refresh_auth_tokens(
 
         *num_refresh_access_token += 1;
         datapoint_info!(
-            "auth_tokens_update_loop-refresh_access_token",
+            datapoint_access_refresh,
             ("url", auth_uri, String),
             ("count", *num_refresh_access_token, i64),
         );

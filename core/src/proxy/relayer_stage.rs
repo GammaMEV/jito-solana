@@ -345,6 +345,8 @@ impl RelayerStage {
         let mut heartbeat_check_interval = interval(expected_heartbeat_interval);
         let mut last_heartbeat_ts = Instant::now();
 
+        let auth_uri_string = relayer_config.auth_service_endpoint.uri().to_string();
+
         info!("connected to packet stream");
 
         while !exit.load(Ordering::Relaxed) {
@@ -367,7 +369,18 @@ impl RelayerStage {
                         return Err(ProxyError::AuthenticationConnectionError("Validator ID Changed".to_string()));
                     }
 
-                    maybe_refresh_auth_tokens(&mut auth_client, relayer_config.auth_service_endpoint.uri().to_string(), &access_token, refresh_token, &cluster_info, connection_timeout, AUTH_REFRESH_LOOKAHEAD, &mut num_full_refreshes, &mut num_refresh_access_token).await?;
+                    maybe_refresh_auth_tokens(&mut auth_client,
+                        "relayer_stage-tokens_generated",
+                        "relayer_stage-refresh_access_token",
+                        &auth_uri_string,
+                        &access_token,
+                        refresh_token,
+                        &cluster_info,
+                        connection_timeout,
+                        AUTH_REFRESH_LOOKAHEAD,
+                        &mut num_full_refreshes,
+                        &mut num_refresh_access_token)
+                    .await?;
                 }
             }
         }

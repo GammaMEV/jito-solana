@@ -352,6 +352,7 @@ impl BlockEngineStage {
         let mut block_engine_stats = BlockEngineStageStats::default();
         let mut metrics_tick = interval(METRICS_TICK);
         let mut maintenance_tick = interval(MAINTENANCE_TICK);
+        let auth_uri_string = block_engine_config.auth_service_endpoint.uri().to_string();
 
         info!("connected to packet and bundle stream");
 
@@ -387,7 +388,18 @@ impl BlockEngineStage {
                     bb_fee.block_builder_commission = block_builder_info.commission;
                     bb_fee.block_builder = Pubkey::from_str(&block_builder_info.pubkey).unwrap_or(bb_fee.block_builder);
 
-                    maybe_refresh_auth_tokens(&mut auth_client, block_engine_config.auth_service_endpoint.uri().to_string(), &access_token, refresh_token, &cluster_info, connection_timeout, AUTH_REFRESH_LOOKAHEAD, &mut num_full_refreshes, &mut num_refresh_access_token).await?;
+                    maybe_refresh_auth_tokens(&mut auth_client,
+                        "block_engine_stage-tokens_generated",
+                        "block_engine_stage-refresh_access_token",
+                        &auth_uri_string,
+                        &access_token,
+                        refresh_token,
+                        &cluster_info,
+                        connection_timeout,
+                        AUTH_REFRESH_LOOKAHEAD,
+                        &mut num_full_refreshes,
+                        &mut num_refresh_access_token)
+                    .await?;
                 }
             }
         }
