@@ -133,7 +133,7 @@ pub async fn maybe_refresh_auth_tokens(
             generate_auth_tokens(auth_service_client, kp.as_ref()),
         )
         .await
-        .map_err(|_| ProxyError::MethodTimeout("refresh_access_token".to_string()))?
+        .map_err(|_| ProxyError::MethodTimeout("generate_auth_tokens".to_string()))?
         .map_err(|e| ProxyError::MethodError(e.to_string()))?;
 
         *access_token.lock().unwrap() = new_access_token.clone();
