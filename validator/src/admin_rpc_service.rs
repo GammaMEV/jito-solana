@@ -33,9 +33,6 @@ pub struct AdminRpcRequestMetadataPostInit {
     pub cluster_info: Arc<ClusterInfo>,
     pub bank_forks: Arc<RwLock<BankForks>>,
     pub vote_account: Pubkey,
-    // ToDo (JL):
-    // pub maybe_block_engine_config: Arc<RwLock<Option<BlockEngineConfig>>>,
-    // pub maybe_relayer_config: Arc<RwLock<Option<RelayerConfig>>>
 }
 
 #[derive(Clone)]
@@ -186,23 +183,6 @@ pub trait AdminRpc {
 
     #[rpc(meta, name = "contactInfo")]
     fn contact_info(&self, meta: Self::Metadata) -> Result<AdminRpcContactInfo>;
-
-    // ToDo (JL):
-    // #[rpc(meta, name = "setBlockEngineConfig")]
-    // fn set_block_engine_config(
-    //     &self,
-    //     meta: Self::Metadata,
-    //     block_engine_url: String,
-    //     trust_packets: bool,
-    // ) -> Result<()>;
-    //
-    // #[rpc(meta, name = "setRelayerConfig")]
-    // fn set_relayer_config(
-    //     &self,
-    //     meta: Self::Metadata,
-    //     relayer_url: String,
-    //     trust_packets: bool,
-    // ) -> Result<()>;
 }
 
 pub struct AdminRpcImpl;
@@ -344,28 +324,6 @@ impl AdminRpc for AdminRpcImpl {
     fn contact_info(&self, meta: Self::Metadata) -> Result<AdminRpcContactInfo> {
         meta.with_post_init(|post_init| Ok(post_init.cluster_info.my_contact_info().into()))
     }
-
-    // fn set_block_engine_config(
-    //     &self,
-    //     meta: Self::Metadata,
-    //     block_engine_url: String,
-    //     trust_packets: bool,
-    // ) -> Result<()> {
-    //     // ToDo (JL): Implement setting block engine config here (create endpoints, ...)
-    //
-    //     Ok(())
-    // }
-
-    // fn set_relayer_config(
-    //     &self,
-    //     meta: Self::Metadata,
-    //     relayer_url: String,
-    //     trust_packets: bool,
-    // ) -> Result<()> {
-    //     // ToDo (JL): Implement setting relayer config here (create endpoints, ...)
-    //
-    //     Ok(())
-    // }
 }
 
 impl AdminRpcImpl {
