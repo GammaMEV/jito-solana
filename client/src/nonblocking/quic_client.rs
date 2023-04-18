@@ -48,7 +48,7 @@ impl SkipServerVerification {
     }
 }
 
-pub const VALIDATOR_PORT_RANGE: PortRange = (10_001, 60_000);
+pub const VALIDATOR_PORT_RANGE: PortRange = (8000, 60_000);
 
 impl rustls::client::ServerCertVerifier for SkipServerVerification {
     fn verify_server_cert(
