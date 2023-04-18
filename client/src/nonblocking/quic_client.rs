@@ -16,7 +16,7 @@ use {
         NewConnection, VarInt, WriteError,
     },
     solana_measure::measure::Measure,
-    solana_net_utils::VALIDATOR_PORT_RANGE,
+    // solana_net_utils::VALIDATOR_PORT_RANGE,
     solana_sdk::{
         quic::{
             QUIC_CONNECTION_HANDSHAKE_TIMEOUT_MS, QUIC_KEEP_ALIVE_MS, QUIC_MAX_TIMEOUT_MS,
@@ -46,6 +46,8 @@ impl SkipServerVerification {
         Arc::new(Self)
     }
 }
+
+pub const VALIDATOR_PORT_RANGE: PortRange = (10_001, 60_000);
 
 impl rustls::client::ServerCertVerifier for SkipServerVerification {
     fn verify_server_cert(
@@ -96,6 +98,10 @@ impl QuicLazyInitializedEndpoint {
             VALIDATOR_PORT_RANGE,
         )
         .expect("QuicLazyInitializedEndpoint::create_endpoint bind_in_range");
+        info!(
+            "QuicLazyInitializedEndpoint::create_endpoint bind_in_range: {:?}",
+            client_socket
+        );
 
         let mut crypto = rustls::ClientConfig::builder()
             .with_safe_defaults()
