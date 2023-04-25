@@ -8,10 +8,18 @@ use {
     tokio::net::UdpSocket,
 };
 
-#[derive(Clone)]
 pub struct UdpTpuConnection {
     socket: UdpSocket,
     addr: SocketAddr,
+}
+
+impl Clone for UdpTpuConnection {
+    fn clone(&self) -> Self {
+        Self {
+            socket: self.socket.try_clone().unwrap(),
+            tpu_addr: self.tpu_addr.clone(),
+        }
+    }
 }
 
 impl UdpTpuConnection {
