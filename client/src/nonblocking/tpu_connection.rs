@@ -17,6 +17,15 @@ pub enum NonblockingConnection {
     UdpTpuConnection,
 }
 
+impl Clone for NonblockingConnection {
+    fn clone(&self) -> Self {
+        match self {
+            NonblockingConnection::QuicTpuConnection(c) => NonblockingConnection::QuicTpuConnection(c.clone()),
+            NonblockingConnection::UdpTpuConnection(c) => NonblockingConnection::UdpTpuConnection(c.clone()),
+        }
+    }
+}
+
 #[async_trait]
 #[enum_dispatch(NonblockingConnection)]
 pub trait TpuConnection {
