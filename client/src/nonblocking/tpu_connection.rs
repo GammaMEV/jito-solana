@@ -20,7 +20,7 @@ pub enum NonblockingConnection {
 impl Clone for NonblockingConnection {
     fn clone(&self) -> Self {
         match self {
-            NonblockingConnection::QuicTpuConnection(c) => NonblockingConnection::QuicTpuConnection(c.clone()),
+            NonblockingConnection::QuicTpuConnection(c) => NonblockingConnection::QuicTpuConnection(c),
             NonblockingConnection::UdpTpuConnection(c) => NonblockingConnection::UdpTpuConnection(c.clone()),
         }
     }

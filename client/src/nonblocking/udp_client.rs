@@ -13,15 +13,6 @@ pub struct UdpTpuConnection {
     addr: SocketAddr,
 }
 
-impl Clone for UdpTpuConnection {
-    fn clone(&self) -> Self {
-        Self {
-            socket: self.socket.try_clone().unwrap(),
-            tpu_addr: self.tpu_addr.clone(),
-        }
-    }
-}
-
 impl UdpTpuConnection {
     pub fn new_from_addr(socket: std::net::UdpSocket, tpu_addr: SocketAddr) -> Self {
         socket.set_nonblocking(true).unwrap();
