@@ -8,6 +8,7 @@ use {
     tokio::net::UdpSocket,
 };
 
+#[derive(Clone)]
 pub struct UdpTpuConnection {
     socket: UdpSocket,
     addr: SocketAddr,
