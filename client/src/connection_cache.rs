@@ -252,7 +252,7 @@ pub struct ConnectionCache {
 }
 
 /// Models the pool of connections
-struct ConnectionPool {
+pub struct ConnectionPool {
     /// The connections in the pool
     connections: Vec<Arc<BaseTpuConnection>>,
 
