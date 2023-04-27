@@ -240,10 +240,10 @@ impl ConnectionCacheStats {
 }
 
 pub struct ConnectionCache {
-    map: RwLock<IndexMap<SocketAddr, ConnectionPool>>,
+    pub map: RwLock<IndexMap<SocketAddr, ConnectionPool>>,
     stats: Arc<ConnectionCacheStats>,
     last_stats: AtomicInterval,
-    connection_pool_size: usize,
+    pub connection_pool_size: usize,
     tpu_udp_socket: Arc<UdpSocket>,
     client_certificate: Arc<QuicClientCertificate>,
     use_quic: bool,
@@ -257,7 +257,7 @@ struct ConnectionPool {
     connections: Vec<Arc<BaseTpuConnection>>,
 
     /// Connections in this pool share the same endpoint
-    endpoint: Option<Arc<QuicLazyInitializedEndpoint>>,
+    pub endpoint: Option<Arc<QuicLazyInitializedEndpoint>>,
 }
 
 impl ConnectionPool {
@@ -271,7 +271,7 @@ impl ConnectionPool {
 
     /// Check if we need to create a new connection. If the count of the connections
     /// is smaller than the pool size.
-    fn need_new_connection(&self, required_pool_size: usize) -> bool {
+    pub fn need_new_connection(&self, required_pool_size: usize) -> bool {
         self.connections.len() < required_pool_size
     }
 }
@@ -323,7 +323,7 @@ impl ConnectionCache {
         self.use_quic
     }
 
-    fn create_endpoint(&self, force_use_udp: bool) -> Option<Arc<QuicLazyInitializedEndpoint>> {
+    pub fn create_endpoint(&self, force_use_udp: bool) -> Option<Arc<QuicLazyInitializedEndpoint>> {
         if self.use_quic() && !force_use_udp {
             Some(Arc::new(QuicLazyInitializedEndpoint::new(
                 self.client_certificate.clone(),
