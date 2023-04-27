@@ -333,7 +333,7 @@ impl ConnectionCache {
         }
     }
 
-    fn compute_max_parallel_streams(&self) -> usize {
+    pub fn compute_max_parallel_streams(&self) -> usize {
         let (client_type, stake, total_stake) =
             self.maybe_client_pubkey
                 .map_or((ConnectionPeerType::Unstaked, 0, 0), |pubkey| {
