@@ -4,7 +4,7 @@ use {
         ancestors::Ancestors,
         bucket_map_holder::{Age, BucketMapHolder},
         contains::Contains,
-        in_mem_accounts_index::InMemAccountsIndex,
+        in_mem_accounts_index::{InMemAccountsIndex, InsertNewEntryResults},
         inline_spl_token::{self, GenericTokenAccount},
         inline_spl_token_2022,
         pubkey_bins::PubkeyBinCalculator24,
@@ -1566,7 +1566,7 @@ impl<T: IndexValue> AccountsIndex<T> {
                 (pubkey_bin, Vec::with_capacity(expected_items_per_bin))
             })
             .collect::<Vec<_>>();
-        let dirty_pubkeys = items
+        let mut dirty_pubkeys = items
             .filter_map(|(pubkey, account_info)| {
                 let pubkey_bin = self.bin_calculator.bin_from_pubkey(&pubkey);
                 let binned_index = (pubkey_bin + random_offset) % bins;
@@ -1597,7 +1597,13 @@ impl<T: IndexValue> AccountsIndex<T> {
                         &self.storage.storage,
                         use_disk,
                     );
-                    r_account_maps.insert_new_entry_if_missing_with_lock(pubkey, new_entry);
+                    match r_account_maps.insert_new_entry_if_missing_with_lock(pubkey, new_entry) {
+                        InsertNewEntryResults::DidNotExist => {}
+                        InsertNewEntryResults::ExistedNewEntryZeroLamports => {}
+                        InsertNewEntryResults::ExistedNewEntryNonZeroLamports => {
+                            dirty_pubkeys.push(pubkey);
+                        }
+                    }
                 });
             }
             insert_time.stop();
@@ -3925,8 +3931,8 @@ pub mod tests {
         );
         assert_eq!((0, usize::MAX), iter.bin_start_and_range());
 
-        let key_0 = Pubkey::new(&[0; 32]);
-        let key_ff = Pubkey::new(&[0xff; 32]);
+        let key_0 = Pubkey::from([0; 32]);
+        let key_ff = Pubkey::from([0xff; 32]);
 
         let iter = AccountsIndexIterator::new(
             &index,
@@ -4179,7 +4185,7 @@ pub mod tests {
         assert_eq!(iter.start_bin(), 0); // no range, so 0
         assert_eq!(iter.end_bin_inclusive(), usize::MAX); // no range, so max
 
-        let key = Pubkey::new(&[0; 32]);
+        let key = Pubkey::from([0; 32]);
         let iter = AccountsIndexIterator::new(
             &index,
             Some(&RangeInclusive::new(key, key)),
@@ -4202,7 +4208,7 @@ pub mod tests {
         assert_eq!(iter.start_bin(), 0); // start at pubkey 0, so 0
         assert_eq!(iter.end_bin_inclusive(), 0); // end at pubkey 0, so 0
 
-        let key = Pubkey::new(&[0xff; 32]);
+        let key = Pubkey::from([0xff; 32]);
         let iter = AccountsIndexIterator::new(
             &index,
             Some(&RangeInclusive::new(key, key)),

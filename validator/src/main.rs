@@ -33,7 +33,7 @@ use {
         tpu::DEFAULT_TPU_COALESCE_MS,
         validator::{is_snapshot_config_valid, Validator, ValidatorConfig, ValidatorStartProgress},
     },
-    solana_gossip::{cluster_info::Node, contact_info::ContactInfo},
+    solana_gossip::{cluster_info::Node, legacy_contact_info::LegacyContactInfo as ContactInfo},
     solana_ledger::blockstore_options::{
         BlockstoreCompressionType, BlockstoreRecoveryMode, LedgerColumnOptions, ShredStorageType,
         DEFAULT_ROCKS_FIFO_SHRED_STORAGE_SIZE_BYTES,
@@ -111,6 +111,7 @@ const DEFAULT_MIN_SNAPSHOT_DOWNLOAD_SPEED: u64 = 10485760;
 // The maximum times of snapshot download abort and retry
 const MAX_SNAPSHOT_DOWNLOAD_ABORT: u32 = 5;
 const MILLIS_PER_SECOND: u64 = 1000;
+const DEFAULT_PREALLOCATED_BUNDLE_COST: u64 = 3000000;
 
 fn monitor_validator(ledger_path: &Path) {
     let dashboard = Dashboard::new(ledger_path, None, None).unwrap_or_else(|err| {
@@ -493,6 +494,7 @@ pub fn main() {
         &DEFAULT_ROCKS_FIFO_SHRED_STORAGE_SIZE_BYTES.to_string();
     let default_tpu_connection_pool_size = &DEFAULT_TPU_CONNECTION_POOL_SIZE.to_string();
     let default_rpc_max_request_body_size = &MAX_REQUEST_BODY_SIZE.to_string();
+    let default_preallocated_bundle_cost = &DEFAULT_PREALLOCATED_BUNDLE_COST.to_string();
 
     let matches = App::new(crate_name!()).about(crate_description!())
         .version(solana_version::version!())
@@ -630,34 +632,35 @@ pub fn main() {
         )
         .arg(
             Arg::with_name("minimal_rpc_api")
-                .long("--minimal-rpc-api")
+                .long("minimal-rpc-api")
                 .takes_value(false)
                 .hidden(true)
                 .help("Only expose the RPC methods required to serve snapshots to other nodes"),
         )
         .arg(
             Arg::with_name("full_rpc_api")
-                .long("--full-rpc-api")
+                .long("full-rpc-api")
                 .conflicts_with("minimal_rpc_api")
                 .takes_value(false)
                 .help("Expose RPC methods for querying chain state and transaction history"),
         )
         .arg(
             Arg::with_name("obsolete_v1_7_rpc_api")
-                .long("--enable-rpc-obsolete_v1_7")
+                .long("enable-rpc-obsolete_v1_7")
                 .takes_value(false)
                 .help("Enable the obsolete RPC methods removed in v1.7"),
         )
         .arg(
             Arg::with_name("private_rpc")
-                .long("--private-rpc")
+                .long("private-rpc")
                 .takes_value(false)
                 .help("Do not publish the RPC port for use by others")
         )
         .arg(
             Arg::with_name("no_port_check")
-                .long("--no-port-check")
+                .long("no-port-check")
                 .takes_value(false)
+                .hidden(true)
                 .help("Do not perform TCP/UDP reachable port checks at start-up")
         )
         .arg(
@@ -972,32 +975,37 @@ pub fn main() {
         .arg(
             Arg::with_name("no_poh_speed_test")
                 .long("no-poh-speed-test")
+                .hidden(true)
                 .help("Skip the check for PoH speed."),
         )
         .arg(
             Arg::with_name("no_os_network_limits_test")
-                .hidden(true)
                 .long("no-os-network-limits-test")
+                .hidden(true)
                 .help("Skip checks for OS network limits.")
         )
         .arg(
             Arg::with_name("no_os_memory_stats_reporting")
                 .long("no-os-memory-stats-reporting")
+                .hidden(true)
                 .help("Disable reporting of OS memory statistics.")
         )
         .arg(
             Arg::with_name("no_os_network_stats_reporting")
                 .long("no-os-network-stats-reporting")
+                .hidden(true)
                 .help("Disable reporting of OS network statistics.")
         )
         .arg(
             Arg::with_name("no_os_cpu_stats_reporting")
                 .long("no-os-cpu-stats-reporting")
+                .hidden(true)
                 .help("Disable reporting of OS CPU statistics.")
         )
         .arg(
             Arg::with_name("no_os_disk_stats_reporting")
                 .long("no-os-disk-stats-reporting")
+                .hidden(true)
                 .help("Disable reporting of OS disk statistics.")
         )
         .arg(
@@ -1675,8 +1683,8 @@ pub fn main() {
         .arg(
             Arg::with_name("accounts_db_skip_shrink")
                 .long("accounts-db-skip-shrink")
-                .help("Enables faster starting of validators by skipping shrink. \
-                      This option is for use during testing."),
+                .help("This is obsolete since it is now enabled by default. Enables faster starting of validators by skipping startup clean and shrink.")
+                .hidden(true),
         )
         .arg(
             Arg::with_name("accounts_db_skip_rewrites")
@@ -1713,13 +1721,20 @@ pub fn main() {
                 .value_name("MEGABYTES")
                 .validator(is_parsable::<usize>)
                 .takes_value(true)
+                .requires("enable_accounts_disk_index")
                 .help("How much memory the accounts index can consume. If this is exceeded, some account index entries will be stored on disk."),
         )
         .arg(
             Arg::with_name("disable_accounts_disk_index")
                 .long("disable-accounts-disk-index")
                 .help("Disable the disk-based accounts index if it is enabled by default.")
-                .conflicts_with("accounts_index_memory_limit_mb")
+                .conflicts_with("enable_accounts_disk_index")
+        )
+        .arg(
+            Arg::with_name("enable_accounts_disk_index")
+                .long("enable-accounts-disk-index")
+                .conflicts_with("disable_accounts_disk_index")
+                .help("Enable the disk-based accounts index if it is disabled by default.")
         )
         .arg(
             Arg::with_name("accounts_index_bins")
@@ -1811,13 +1826,6 @@ pub fn main() {
                        total bytes used. If the account's shrink ratio is less than this ratio \
                        it becomes a candidate for shrinking. The value must between 0. and 1.0 \
                        inclusive."),
-        )
-        .arg(
-            Arg::with_name("no_duplicate_instance_check")
-                .long("no-duplicate-instance-check")
-                .takes_value(false)
-                .help("Disables duplicate instance check")
-                .hidden(true),
         )
         .arg(
             Arg::with_name("allow_private_addr")
@@ -1921,6 +1929,14 @@ pub fn main() {
                 .value_name("COMMISSION_BPS")
                 .takes_value(true)
                 .help("The commission validator takes from tips expressed in basis points.")
+        )
+        .arg(
+            Arg::with_name("preallocated_bundle_cost")
+                .long("preallocated-bundle-cost")
+                .value_name("PREALLOCATED_BUNDLE_COST")
+                .takes_value(true)
+                .default_value(default_preallocated_bundle_cost)
+                .help("Number of CUs to allocate for bundles at beginning of slot.")
         )
         .arg(
             Arg::with_name("shred_receiver_address")
@@ -2565,10 +2581,13 @@ pub fn main() {
     accounts_index_config.index_limit_mb =
         if let Some(limit) = value_t!(matches, "accounts_index_memory_limit_mb", usize).ok() {
             IndexLimitMb::Limit(limit)
-        } else if matches.is_present("disable_accounts_disk_index") {
-            IndexLimitMb::InMemOnly
-        } else {
+        } else if matches.is_present("enable_accounts_disk_index") {
             IndexLimitMb::Unspecified
+        } else {
+            if matches.is_present("disable_accounts_disk_index") {
+                warn!("ignoring `--disable-accounts-disk-index` as it specifies default behavior");
+            }
+            IndexLimitMb::InMemOnly
         };
 
     {
@@ -2694,6 +2713,10 @@ pub fn main() {
         exit(1);
     }
     let full_api = matches.is_present("full_rpc_api");
+
+    if matches.is_present("accounts_db_skip_shrink") {
+        warn!("`--accounts-db-skip-shrink` is deprecated. please consider removing it from the validator command line argument list");
+    }
 
     let voting_disabled = matches.is_present("no_voting") || restricted_repair_only_mode;
     let tip_manager_config = tip_manager_config_from_matches(&matches, voting_disabled);
@@ -2928,7 +2951,7 @@ pub fn main() {
         accounts_db_caching_enabled: true,
         accounts_db_test_hash_calculation: matches.is_present("accounts_db_test_hash_calculation"),
         accounts_db_config,
-        accounts_db_skip_shrink: matches.is_present("accounts_db_skip_shrink"),
+        accounts_db_skip_shrink: true,
         tpu_coalesce_ms,
         no_wait_for_vote_to_start_leader: matches.is_present("no_wait_for_vote_to_start_leader"),
         accounts_shrink_ratio,
@@ -2943,6 +2966,8 @@ pub fn main() {
         shred_receiver_address: matches
             .value_of("shred_receiver_address")
             .map(|address| SocketAddr::from_str(address).expect("shred_receiver_address invalid")),
+        preallocated_bundle_cost: value_of(&matches, "preallocated_bundle_cost")
+            .unwrap_or(DEFAULT_PREALLOCATED_BUNDLE_COST),
         ..ValidatorConfig::default()
     };
 
@@ -3193,7 +3218,7 @@ pub fn main() {
         if SystemMonitorService::check_os_network_limits() {
             info!("OS network limits test passed.");
         } else {
-            eprintln!("OS network limit test failed. solana-sys-tuner may be used to configure OS network limits. Bypass check with --no-os-network-limits-test.");
+            eprintln!("OS network limit test failed. See: https://docs.solana.com/running-validator/validator-start#system-tuning");
             exit(1);
         }
     }
@@ -3324,7 +3349,7 @@ pub fn main() {
 
     let identity_keypair = Arc::new(identity_keypair);
 
-    let should_check_duplicate_instance = !matches.is_present("no_duplicate_instance_check");
+    let should_check_duplicate_instance = true;
     if !cluster_entrypoints.is_empty() {
         bootstrap::rpc_bootstrap(
             &node,

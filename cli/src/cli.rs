@@ -221,7 +221,7 @@ pub enum CliCommand {
         nonce_authority: SignerIndex,
         memo: Option<String>,
         fee_payer: SignerIndex,
-        redelegation_stake_account_pubkey: Option<Pubkey>,
+        redelegation_stake_account: Option<SignerIndex>,
         compute_unit_price: Option<u64>,
     },
     SplitStake {
@@ -1184,7 +1184,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             nonce_authority,
             memo,
             fee_payer,
-            redelegation_stake_account_pubkey,
+            redelegation_stake_account,
             compute_unit_price,
         } => process_delegate_stake(
             &rpc_client,
@@ -1200,7 +1200,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *nonce_authority,
             memo.as_ref(),
             *fee_payer,
-            redelegation_stake_account_pubkey.as_ref(),
+            *redelegation_stake_account,
             compute_unit_price.as_ref(),
         ),
         CliCommand::SplitStake {
@@ -2617,7 +2617,7 @@ mod tests {
         );
 
         //Test Transfer Subcommand, with nonce
-        let nonce_address = Pubkey::new(&[1u8; 32]);
+        let nonce_address = Pubkey::from([1u8; 32]);
         let nonce_address_string = nonce_address.to_string();
         let nonce_authority = keypair_from_seed(&[2u8; 32]).unwrap();
         let nonce_authority_file = make_tmp_path("nonce_authority_file");

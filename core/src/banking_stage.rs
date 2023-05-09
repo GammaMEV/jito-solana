@@ -25,7 +25,9 @@ use {
     min_max_heap::MinMaxHeap,
     solana_client::{connection_cache::ConnectionCache, tpu_connection::TpuConnection},
     solana_entry::entry::hash_transactions,
-    solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
+    solana_gossip::{
+        cluster_info::ClusterInfo, legacy_contact_info::LegacyContactInfo as ContactInfo,
+    },
     solana_ledger::{
         blockstore_processor::TransactionStatusSender, token_balances::collect_token_balances,
     },
@@ -1654,8 +1656,12 @@ impl BankingStage {
 
         let transaction_costs = qos_service.compute_transaction_costs(txs.iter());
 
-        let (transactions_qos_results, num_included) =
-            qos_service.select_transactions_per_cost(txs.iter(), transaction_costs.iter(), bank);
+        let (transactions_qos_results, num_included) = qos_service.select_transactions_per_cost(
+            txs.iter(),
+            transaction_costs.iter(),
+            bank.slot(),
+            &mut bank.write_cost_tracker().unwrap(),
+        );
 
         let cost_model_throttled_transactions_count = txs.len().saturating_sub(num_included);
 
@@ -2354,7 +2360,7 @@ mod tests {
         crossbeam_channel::{unbounded, Receiver},
         solana_address_lookup_table_program::state::{AddressLookupTable, LookupTableMeta},
         solana_entry::entry::{next_entry, next_versioned_entry, EntrySlice},
-        solana_gossip::{cluster_info::Node, contact_info::ContactInfo},
+        solana_gossip::cluster_info::Node,
         solana_ledger::{
             blockstore::{entries_to_test_shreds, Blockstore},
             genesis_utils::{create_genesis_config, GenesisConfigInfo},

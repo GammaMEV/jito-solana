@@ -45,7 +45,6 @@ pub mod multi_iterator_scanner;
 pub mod optimistic_confirmation_verifier;
 pub mod outstanding_requests;
 pub mod packet_bundle;
-mod packet_hasher;
 pub mod packet_threshold;
 pub mod poh_timing_report_service;
 pub mod poh_timing_reporter;

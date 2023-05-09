@@ -109,7 +109,7 @@ use {
         feature_set::{
             self, add_set_compute_unit_price_ix, default_units_per_instruction,
             disable_fee_calculator, enable_early_verification_of_account_modifications,
-            use_default_units_in_fee_calculation, FeatureSet,
+            enable_request_heap_frame_ix, use_default_units_in_fee_calculation, FeatureSet,
         },
         fee::FeeStructure,
         fee_calculator::{FeeCalculator, FeeRateGovernor},
@@ -171,6 +171,7 @@ use {
         thread::Builder,
         time::{Duration, Instant},
     },
+    thiserror::Error,
 };
 
 /// params to `verify_bank_hash`
@@ -519,6 +520,12 @@ pub struct BundleSimulationResult {
     /// Gives high level summary of bundle.
     pub summary: BundleSimulationSummary,
     pub transaction_results: Vec<BundleTransactionSimulationResult>,
+}
+
+#[derive(Error, Debug)]
+pub enum SimulateBundleError {
+    #[error("account missing from bank: {0}")]
+    AccountNotFoundInBank(Pubkey),
 }
 
 #[derive(Clone)]
@@ -1746,7 +1753,7 @@ impl Bank {
                             apply_feature_activations_time.as_us(),
                             i64
                         ),
-                        ("activate_epoch_Us", activate_epoch_time.as_us(), i64),
+                        ("activate_epoch_us", activate_epoch_time.as_us(), i64),
                         (
                             "update_epoch_stakes_us",
                             update_epoch_stakes_time.as_us(),
@@ -3544,6 +3551,7 @@ impl Bank {
                 .is_active(&add_set_compute_unit_price_ix::id()),
             self.feature_set
                 .is_active(&use_default_units_in_fee_calculation::id()),
+            self.enable_request_heap_frame_ix(),
         ))
     }
 
@@ -3587,6 +3595,7 @@ impl Bank {
                 .is_active(&add_set_compute_unit_price_ix::id()),
             self.feature_set
                 .is_active(&use_default_units_in_fee_calculation::id()),
+            self.enable_request_heap_frame_ix(),
         )
     }
 
@@ -3846,7 +3855,7 @@ impl Bank {
         bundle: Vec<SanitizedTransaction>,
         pre_execution_accounts_requested: Vec<Option<Vec<Pubkey>>>,
         post_execution_accounts_requested: Vec<Option<Vec<Pubkey>>>,
-    ) -> result::Result<BundleSimulationResult, Box<dyn Error>> {
+    ) -> result::Result<BundleSimulationResult, SimulateBundleError> {
         assert_eq!(pre_execution_accounts_requested.len(), bundle.len());
         assert_eq!(post_execution_accounts_requested.len(), bundle.len());
 
@@ -3916,8 +3925,7 @@ impl Bank {
                             Ok(data)
                         } else {
                             self.get_account(pubkey)
-                                // TODO(seg): let's use a concrete error type
-                                .ok_or(format!("pubkey {} does not exist", pubkey))
+                                .ok_or(SimulateBundleError::AccountNotFoundInBank(*pubkey))
                         }?;
                         pre_accounts.push(AccountData {
                             pubkey: *pubkey,
@@ -4596,6 +4604,15 @@ impl Bank {
         }
     }
 
+    // A cluster specific feature gate, when not activated it keeps v1.13 behavior in mainnet-beta;
+    // once activated for v1.14+, it allows compute_budget::request_heap_frame and
+    // compute_budget::set_compute_unit_price co-exist in same transaction.
+    fn enable_request_heap_frame_ix(&self) -> bool {
+        self.feature_set
+            .is_active(&enable_request_heap_frame_ix::id())
+            || self.cluster_type() != ClusterType::MainnetBeta
+    }
+
     #[allow(clippy::type_complexity)]
     pub fn load_and_execute_transactions(
         &self,
@@ -4701,6 +4718,7 @@ impl Bank {
                             tx.message().program_instructions_iter(),
                             feature_set.is_active(&default_units_per_instruction::id()),
                             feature_set.is_active(&add_set_compute_unit_price_ix::id()),
+                            true, // don't reject txs that use request heap size ix
                         );
                         compute_budget_process_transaction_time.stop();
                         saturating_add_assign!(
@@ -4987,6 +5005,7 @@ impl Bank {
         fee_structure: &FeeStructure,
         support_set_compute_unit_price_ix: bool,
         use_default_units_per_instruction: bool,
+        enable_request_heap_frame_ix: bool,
     ) -> u64 {
         // Fee based on compute units and signatures
         const BASE_CONGESTION: f64 = 5_000.0;
@@ -5003,6 +5022,7 @@ impl Bank {
                 message.program_instructions_iter(),
                 use_default_units_per_instruction,
                 support_set_compute_unit_price_ix,
+                enable_request_heap_frame_ix,
             )
             .unwrap_or_default();
         let prioritization_fee = prioritization_fee_details.get_fee();
@@ -5070,6 +5090,7 @@ impl Bank {
                         .is_active(&add_set_compute_unit_price_ix::id()),
                     self.feature_set
                         .is_active(&use_default_units_in_fee_calculation::id()),
+                    self.enable_request_heap_frame_ix(),
                 );
 
                 // In case of instruction error, even though no accounts
@@ -9915,7 +9936,7 @@ pub(crate) mod tests {
     #[allow(clippy::cognitive_complexity)]
     fn test_rent_complex() {
         solana_logger::setup();
-        let mock_program_id = Pubkey::new(&[2u8; 32]);
+        let mock_program_id = Pubkey::from([2u8; 32]);
 
         #[derive(Serialize, Deserialize)]
         enum MockInstruction {
@@ -10906,7 +10927,7 @@ pub(crate) mod tests {
     fn test_collect_rent_from_accounts() {
         solana_logger::setup();
 
-        let zero_lamport_pubkey = Pubkey::new(&[0; 32]);
+        let zero_lamport_pubkey = Pubkey::from([0; 32]);
 
         let genesis_bank = create_simple_test_arc_bank(100000);
         let first_bank = Arc::new(new_from_parent(&genesis_bank));
@@ -11755,6 +11776,7 @@ pub(crate) mod tests {
             &FeeStructure::default(),
             true,
             true,
+            true,
         );
 
         let (expected_fee_collected, expected_fee_burned) =
@@ -11937,6 +11959,7 @@ pub(crate) mod tests {
             &FeeStructure::default(),
             true,
             true,
+            true,
         );
         assert_eq!(
             bank.get_balance(&mint_keypair.pubkey()),
@@ -11953,6 +11976,7 @@ pub(crate) mod tests {
             &SanitizedMessage::try_from(Message::new(&[], Some(&Pubkey::new_unique()))).unwrap(),
             expensive_lamports_per_signature,
             &FeeStructure::default(),
+            true,
             true,
             true,
         );
@@ -12069,6 +12093,7 @@ pub(crate) mod tests {
                                 .create_fee_calculator()
                                 .lamports_per_signature,
                             &FeeStructure::default(),
+                            true,
                             true,
                             true,
                         ) * 2
@@ -13359,7 +13384,7 @@ pub(crate) mod tests {
 
         let bank0 = Arc::new(new_from_parent(&parent));
         let pubkey0 = solana_sdk::pubkey::new_rand();
-        let program_id = Pubkey::new(&[2; 32]);
+        let program_id = Pubkey::from([2; 32]);
         let account0 = AccountSharedData::new(1, 0, &program_id);
         bank0.store_account(&pubkey0, &account0);
 
@@ -13544,7 +13569,7 @@ pub(crate) mod tests {
         let mut bank = Bank::new_for_tests(&genesis_config);
 
         fn mock_vote_program_id() -> Pubkey {
-            Pubkey::new(&[42u8; 32])
+            Pubkey::from([42u8; 32])
         }
         fn mock_vote_processor(
             _first_instruction_account: usize,
@@ -14108,7 +14133,7 @@ pub(crate) mod tests {
         let blockhash = bank.last_blockhash();
         bank.store_account(&nonce.pubkey(), &nonce_account);
 
-        let ix = system_instruction::assign(&nonce.pubkey(), &Pubkey::new(&[9u8; 32]));
+        let ix = system_instruction::assign(&nonce.pubkey(), &Pubkey::from([9u8; 32]));
         let message = Message::new(&[ix], Some(&nonce.pubkey()));
         let tx = Transaction::new(&[&nonce], message, blockhash);
 
@@ -14802,7 +14827,7 @@ pub(crate) mod tests {
         let keypair = Keypair::new();
         let pubkey0 = solana_sdk::pubkey::new_rand();
         let pubkey1 = solana_sdk::pubkey::new_rand();
-        let program_id = Pubkey::new(&[2; 32]);
+        let program_id = Pubkey::from([2; 32]);
         let keypair_account = AccountSharedData::new(8, 0, &program_id);
         let account0 = AccountSharedData::new(11, 0, &program_id);
         let program_account = AccountSharedData::new(1, 10, &Pubkey::default());
@@ -14950,7 +14975,7 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        let mock_program_id = Pubkey::new(&[2u8; 32]);
+        let mock_program_id = Pubkey::from([2u8; 32]);
         bank.add_builtin("mock_program", &mock_program_id, mock_process_instruction);
 
         let from_pubkey = solana_sdk::pubkey::new_rand();
@@ -14994,7 +15019,7 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        let mock_program_id = Pubkey::new(&[2u8; 32]);
+        let mock_program_id = Pubkey::from([2u8; 32]);
         bank.add_builtin("mock_program", &mock_program_id, mock_process_instruction);
 
         let from_pubkey = solana_sdk::pubkey::new_rand();
@@ -15414,7 +15439,7 @@ pub(crate) mod tests {
 
         let mut genesis_config = GenesisConfig::new(
             &[(
-                Pubkey::new(&[42; 32]),
+                Pubkey::from([42; 32]),
                 AccountSharedData::new(1_000_000_000_000, 0, &system_program::id()),
             )],
             &[],
@@ -15531,8 +15556,8 @@ pub(crate) mod tests {
         solana_logger::setup();
 
         let (genesis_config, _mint_keypair) = create_genesis_config(1_000_000_000);
-        let pubkey0 = Pubkey::new(&[0; 32]);
-        let pubkey1 = Pubkey::new(&[1; 32]);
+        let pubkey0 = Pubkey::from([0; 32]);
+        let pubkey1 = Pubkey::from([1; 32]);
 
         info!("pubkey0: {}", pubkey0);
         info!("pubkey1: {}", pubkey1);
@@ -17706,12 +17731,12 @@ pub(crate) mod tests {
         );
         let mut bank = Bank::new_for_tests(&genesis_config);
 
-        let mock_program_id = Pubkey::new(&[2u8; 32]);
+        let mock_program_id = Pubkey::from([2u8; 32]);
         fn mock_process_instruction(
             _first_instruction_account: usize,
             invoke_context: &mut InvokeContext,
         ) -> result::Result<(), InstructionError> {
-            let mock_program_id = Pubkey::new(&[2u8; 32]);
+            let mock_program_id = Pubkey::from([2u8; 32]);
             let transaction_context = &mut invoke_context.transaction_context;
             let instruction_context = transaction_context.get_current_instruction_context()?;
             let instruction_data = instruction_context.get_instruction_data();
@@ -18434,6 +18459,7 @@ pub(crate) mod tests {
                 },
                 true,
                 true,
+                true,
             ),
             0
         );
@@ -18447,6 +18473,7 @@ pub(crate) mod tests {
                     lamports_per_signature: 1,
                     ..FeeStructure::default()
                 },
+                true,
                 true,
                 true,
             ),
@@ -18469,6 +18496,7 @@ pub(crate) mod tests {
                 },
                 true,
                 true,
+                true,
             ),
             4
         );
@@ -18488,7 +18516,7 @@ pub(crate) mod tests {
         let message =
             SanitizedMessage::try_from(Message::new(&[], Some(&Pubkey::new_unique()))).unwrap();
         assert_eq!(
-            Bank::calculate_fee(&message, 1, &fee_structure, true, true,),
+            Bank::calculate_fee(&message, 1, &fee_structure, true, true, true),
             max_fee + lamports_per_signature
         );
 
@@ -18500,7 +18528,7 @@ pub(crate) mod tests {
             SanitizedMessage::try_from(Message::new(&[ix0, ix1], Some(&Pubkey::new_unique())))
                 .unwrap();
         assert_eq!(
-            Bank::calculate_fee(&message, 1, &fee_structure, true, true,),
+            Bank::calculate_fee(&message, 1, &fee_structure, true, true, true),
             max_fee + 3 * lamports_per_signature
         );
 
@@ -18533,7 +18561,7 @@ pub(crate) mod tests {
                 Some(&Pubkey::new_unique()),
             ))
             .unwrap();
-            let fee = Bank::calculate_fee(&message, 1, &fee_structure, true, true);
+            let fee = Bank::calculate_fee(&message, 1, &fee_structure, true, true, true);
             assert_eq!(
                 fee,
                 lamports_per_signature + prioritization_fee_details.get_fee()
@@ -18572,7 +18600,7 @@ pub(crate) mod tests {
         ))
         .unwrap();
         assert_eq!(
-            Bank::calculate_fee(&message, 1, &fee_structure, true, true,),
+            Bank::calculate_fee(&message, 1, &fee_structure, true, true, true),
             2
         );
 
@@ -18584,7 +18612,7 @@ pub(crate) mod tests {
         ))
         .unwrap();
         assert_eq!(
-            Bank::calculate_fee(&message, 1, &fee_structure, true, true,),
+            Bank::calculate_fee(&message, 1, &fee_structure, true, true, true),
             11
         );
     }
@@ -19545,7 +19573,7 @@ pub(crate) mod tests {
         assert!(bank.rewrites_skipped_this_slot.read().unwrap().is_empty());
 
         // bank's map is initially empty
-        let mut test = vec![(Pubkey::new(&[4; 32]), Hash::new(&[5; 32]))];
+        let mut test = vec![(Pubkey::from([4; 32]), Hash::new(&[5; 32]))];
         bank.remember_skipped_rewrites(test.clone());
         assert_eq!(
             *bank.rewrites_skipped_this_slot.read().unwrap(),
@@ -19553,7 +19581,7 @@ pub(crate) mod tests {
         );
 
         // now there is already some stuff in the bank's map
-        test.push((Pubkey::new(&[6; 32]), Hash::new(&[7; 32])));
+        test.push((Pubkey::from([6; 32]), Hash::new(&[7; 32])));
         bank.remember_skipped_rewrites(test[1..].to_vec());
         assert_eq!(
             *bank.rewrites_skipped_this_slot.read().unwrap(),
@@ -20070,8 +20098,8 @@ pub(crate) mod tests {
         assert!(bank.get_rent_paying_pubkeys(&(0, 2, n)).is_none());
         assert!(bank.get_rent_paying_pubkeys(&(0, 0, n)).is_none());
 
-        let pk1 = Pubkey::new(&[2; 32]);
-        let pk2 = Pubkey::new(&[3; 32]);
+        let pk1 = Pubkey::from([2; 32]);
+        let pk2 = Pubkey::from([3; 32]);
         let index1 = Bank::partition_from_pubkey(&pk1, n);
         let index2 = Bank::partition_from_pubkey(&pk2, n);
         assert!(index1 > 0, "{}", index1);
@@ -20227,5 +20255,59 @@ pub(crate) mod tests {
                 bank.get_total_accounts_stats().unwrap().data_len,
             );
         }
+    }
+
+    #[test]
+    fn test_calculate_fee_with_request_heap_frame_flag() {
+        let key0 = Pubkey::new_unique();
+        let key1 = Pubkey::new_unique();
+        let lamports_per_signature: u64 = 5_000;
+        let signature_fee: u64 = 10;
+        let request_cu: u64 = 1;
+        let lamports_per_cu: u64 = 5;
+        let fee_structure = FeeStructure {
+            lamports_per_signature: signature_fee,
+            ..FeeStructure::default()
+        };
+        let message = SanitizedMessage::try_from(Message::new(
+            &[
+                system_instruction::transfer(&key0, &key1, 1),
+                ComputeBudgetInstruction::set_compute_unit_limit(request_cu as u32),
+                ComputeBudgetInstruction::request_heap_frame(40 * 1024),
+                ComputeBudgetInstruction::set_compute_unit_price(lamports_per_cu * 1_000_000),
+            ],
+            Some(&key0),
+        ))
+        .unwrap();
+
+        // assert when enable_request_heap_frame_ix is enabled, prioritization fee will be counted
+        // into transaction fee
+        let mut enable_request_heap_frame_ix = true;
+        assert_eq!(
+            Bank::calculate_fee(
+                &message,
+                lamports_per_signature,
+                &fee_structure,
+                true,
+                true,
+                enable_request_heap_frame_ix,
+            ),
+            signature_fee + request_cu * lamports_per_cu
+        );
+
+        // assert when enable_request_heap_frame_ix is disabled (an v1.13 behavior), prioritization fee will not be counted
+        // into transaction fee
+        enable_request_heap_frame_ix = false;
+        assert_eq!(
+            Bank::calculate_fee(
+                &message,
+                lamports_per_signature,
+                &fee_structure,
+                true,
+                true,
+                enable_request_heap_frame_ix,
+            ),
+            signature_fee
+        );
     }
 }

@@ -121,6 +121,10 @@ impl RpcRequestMiddleware {
             .unwrap()
     }
 
+    fn strip_leading_slash(path: &str) -> Option<&str> {
+        path.strip_prefix('/')
+    }
+
     fn is_file_get_path(&self, path: &str) -> bool {
         if path == DEFAULT_GENESIS_DOWNLOAD_PATH {
             return true;
@@ -130,15 +134,13 @@ impl RpcRequestMiddleware {
             return false;
         }
 
-        let starting_character = '/';
-        if !path.starts_with(starting_character) {
-            return false;
+        match Self::strip_leading_slash(path) {
+            None => false,
+            Some(path) => {
+                self.full_snapshot_archive_path_regex.is_match(path)
+                    || self.incremental_snapshot_archive_path_regex.is_match(path)
+            }
         }
-
-        let path = path.trim_start_matches(starting_character);
-
-        self.full_snapshot_archive_path_regex.is_match(path)
-            || self.incremental_snapshot_archive_path_regex.is_match(path)
     }
 
     #[cfg(unix)]
@@ -188,8 +190,8 @@ impl RpcRequestMiddleware {
     }
 
     fn process_file_get(&self, path: &str) -> RequestMiddlewareAction {
-        let stem = path.split_at(1).1; // Drop leading '/' from path
         let filename = {
+            let stem = Self::strip_leading_slash(path).expect("path already verified");
             match path {
                 DEFAULT_GENESIS_DOWNLOAD_PATH => {
                     inc_new_counter_info!("rpc-get_genesis", 1);
@@ -357,7 +359,8 @@ impl JsonRpcService {
         max_slots: Arc<MaxSlots>,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         connection_cache: Arc<ConnectionCache>,
-        current_transaction_status_slot: Arc<AtomicU64>,
+        max_complete_transaction_status_slot: Arc<AtomicU64>,
+        max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     ) -> Self {
         info!("rpc bound to {:?}", rpc_addr);
@@ -423,7 +426,8 @@ impl JsonRpcService {
                                 bigtable_ledger_storage.clone(),
                                 blockstore.clone(),
                                 block_commitment_cache.clone(),
-                                current_transaction_status_slot.clone(),
+                                max_complete_transaction_status_slot.clone(),
+                                max_complete_rewards_slot.clone(),
                                 ConfirmedBlockUploadConfig::default(),
                                 exit_bigtable_ledger_upload_service.clone(),
                             )))
@@ -464,7 +468,8 @@ impl JsonRpcService {
             largest_accounts_cache,
             max_slots,
             leader_schedule_cache,
-            current_transaction_status_slot,
+            max_complete_transaction_status_slot,
+            max_complete_rewards_slot,
             prioritization_fee_cache,
         );
 
@@ -573,9 +578,9 @@ mod tests {
         crate::rpc::create_validator_exit,
         solana_client::rpc_config::RpcContextConfig,
         solana_gossip::{
-            contact_info::ContactInfo,
             crds::GossipRoute,
             crds_value::{CrdsData, CrdsValue, SnapshotHashes},
+            legacy_contact_info::LegacyContactInfo as ContactInfo,
         },
         solana_ledger::{
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
@@ -647,6 +652,7 @@ mod tests {
             Arc::new(LeaderScheduleCache::default()),
             connection_cache,
             Arc::new(AtomicU64::default()),
+            Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
         );
         let thread = rpc_service.thread_hdl.thread();
@@ -685,6 +691,35 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_prefix() {
+        assert_eq!(RpcRequestMiddleware::strip_leading_slash("/"), Some(""));
+        assert_eq!(RpcRequestMiddleware::strip_leading_slash("//"), Some("/"));
+        assert_eq!(
+            RpcRequestMiddleware::strip_leading_slash("/abc"),
+            Some("abc")
+        );
+        assert_eq!(
+            RpcRequestMiddleware::strip_leading_slash("//abc"),
+            Some("/abc")
+        );
+        assert_eq!(
+            RpcRequestMiddleware::strip_leading_slash("/./abc"),
+            Some("./abc")
+        );
+        assert_eq!(
+            RpcRequestMiddleware::strip_leading_slash("/../abc"),
+            Some("../abc")
+        );
+
+        assert_eq!(RpcRequestMiddleware::strip_leading_slash(""), None);
+        assert_eq!(RpcRequestMiddleware::strip_leading_slash("./"), None);
+        assert_eq!(RpcRequestMiddleware::strip_leading_slash("../"), None);
+        assert_eq!(RpcRequestMiddleware::strip_leading_slash("."), None);
+        assert_eq!(RpcRequestMiddleware::strip_leading_slash(".."), None);
+        assert_eq!(RpcRequestMiddleware::strip_leading_slash("abc"), None);
+    }
+
+    #[test]
     fn test_is_file_get_path() {
         let bank_forks = create_bank_forks();
         let rrm = RpcRequestMiddleware::new(
@@ -702,6 +737,8 @@ mod tests {
 
         assert!(rrm.is_file_get_path(DEFAULT_GENESIS_DOWNLOAD_PATH));
         assert!(!rrm.is_file_get_path(DEFAULT_GENESIS_ARCHIVE));
+        assert!(!rrm.is_file_get_path("//genesis.tar.bz2"));
+        assert!(!rrm.is_file_get_path("/../genesis.tar.bz2"));
 
         assert!(!rrm.is_file_get_path("/snapshot.tar.bz2")); // This is a redirect
 
@@ -751,8 +788,34 @@ mod tests {
             .is_file_get_path("../../../test/incremental-snapshot-123-456-xxx.tar"));
 
         assert!(!rrm.is_file_get_path("/"));
+        assert!(!rrm.is_file_get_path("//"));
+        assert!(!rrm.is_file_get_path("/."));
+        assert!(!rrm.is_file_get_path("/./"));
+        assert!(!rrm.is_file_get_path("/.."));
+        assert!(!rrm.is_file_get_path("/../"));
+        assert!(!rrm.is_file_get_path("."));
+        assert!(!rrm.is_file_get_path("./"));
+        assert!(!rrm.is_file_get_path(".//"));
         assert!(!rrm.is_file_get_path(".."));
+        assert!(!rrm.is_file_get_path("../"));
+        assert!(!rrm.is_file_get_path("..//"));
         assert!(!rrm.is_file_get_path("🎣"));
+
+        assert!(!rrm_with_snapshot_config
+            .is_file_get_path("//snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"));
+        assert!(!rrm_with_snapshot_config
+            .is_file_get_path("/./snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"));
+        assert!(!rrm_with_snapshot_config
+            .is_file_get_path("/../snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"));
+        assert!(!rrm_with_snapshot_config.is_file_get_path(
+            "//incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"
+        ));
+        assert!(!rrm_with_snapshot_config.is_file_get_path(
+            "/./incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"
+        ));
+        assert!(!rrm_with_snapshot_config.is_file_get_path(
+            "/../incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"
+        ));
     }
 
     #[test]

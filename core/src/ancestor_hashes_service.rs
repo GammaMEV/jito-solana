@@ -760,7 +760,7 @@ mod test {
     use {
         super::*,
         crate::{
-            cluster_slot_state_verifier::DuplicateSlotsToRepair,
+            cluster_slot_state_verifier::{DuplicateSlotsToRepair, PurgeRepairSlotCounter},
             repair_service::DuplicateSlotsResetReceiver,
             replay_stage::{
                 tests::{replay_blockstore_components, ReplayBlockstoreComponents},
@@ -771,7 +771,7 @@ mod test {
         },
         solana_gossip::{
             cluster_info::{ClusterInfo, Node},
-            contact_info::ContactInfo,
+            legacy_contact_info::LegacyContactInfo as ContactInfo,
         },
         solana_ledger::{blockstore::make_many_slot_entries, get_tmp_ledger_path, shred::Nonce},
         solana_runtime::{accounts_background_service::AbsRequestSender, bank_forks::BankForks},
@@ -1621,6 +1621,7 @@ mod test {
             &bank_forks,
             &requester_blockstore,
             None,
+            &mut PurgeRepairSlotCounter::default(),
         );
 
         // Simulate making a request

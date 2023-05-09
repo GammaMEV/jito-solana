@@ -11,7 +11,7 @@ use {
         recycler::Recycler,
     },
     ahash::AHasher,
-    rand::{thread_rng, Rng},
+    rand::Rng,
     rayon::{prelude::*, ThreadPool},
     solana_metrics::inc_new_counter_debug,
     solana_rayon_threadlimit::get_thread_count,
@@ -19,15 +19,16 @@ use {
         hash::Hash,
         message::{MESSAGE_HEADER_LENGTH, MESSAGE_VERSION_PREFIX},
         pubkey::Pubkey,
-        saturating_add_assign,
         short_vec::decode_shortu16_len,
         signature::Signature,
     },
     std::{
         convert::TryFrom,
         hash::Hasher,
+        iter::repeat_with,
+        marker::PhantomData,
         mem::size_of,
-        sync::atomic::{AtomicBool, AtomicU64, Ordering},
+        sync::atomic::{AtomicU64, Ordering},
         time::{Duration, Instant},
     },
 };
@@ -367,6 +368,15 @@ fn check_for_simple_vote_transaction(
         return Err(PacketError::InvalidSignatureLen);
     }
 
+    // simple vote should only be legacy message
+    let msg_start = (packet_offsets.msg_start as usize)
+        .checked_sub(current_offset)
+        .ok_or(PacketError::InvalidLen)?;
+    let message_prefix = *packet.data(msg_start).ok_or(PacketError::InvalidLen)?;
+    if message_prefix & MESSAGE_VERSION_PREFIX != 0 {
+        return Ok(());
+    }
+
     let pubkey_start = (packet_offsets.pubkey_start as usize)
         .checked_sub(current_offset)
         .ok_or(PacketError::InvalidLen)?;
@@ -486,92 +496,100 @@ pub fn generate_offsets(
     )
 }
 
-pub struct Deduper {
-    filter: Vec<AtomicU64>,
-    seed: (u128, u128),
-    age: Instant,
-    max_age: Duration,
-    pub saturated: AtomicBool,
+pub struct Deduper<const K: usize, T: ?Sized> {
+    num_bits: u64,
+    bits: Vec<AtomicU64>,
+    seeds: [(u128, u128); K],
+    clock: Instant,
+    popcount: AtomicU64, // Number of one bits in self.bits.
+    _phantom: PhantomData<T>,
 }
 
-impl Deduper {
-    pub fn new(size: u32, max_age: Duration) -> Self {
-        let mut filter: Vec<AtomicU64> = Vec::with_capacity(size as usize);
-        filter.resize_with(size as usize, Default::default);
-        let seed = thread_rng().gen();
+impl<const K: usize, T: ?Sized + std::hash::Hash> Deduper<K, T> {
+    pub fn new<R: Rng>(rng: &mut R, num_bits: u64) -> Self {
+        let size = num_bits.checked_add(63).unwrap() / 64;
+        let size = usize::try_from(size).unwrap();
         Self {
-            filter,
-            seed,
-            age: Instant::now(),
-            max_age,
-            saturated: AtomicBool::new(false),
+            num_bits,
+            seeds: [(); K].map(|_| rng.gen()),
+            clock: Instant::now(),
+            bits: repeat_with(AtomicU64::default).take(size).collect(),
+            popcount: AtomicU64::default(),
+            _phantom: PhantomData::<T>::default(),
         }
     }
 
-    pub fn reset(&mut self) {
-        let now = Instant::now();
-        //this should reset every 500k unique packets per 1m sized deduper
-        //false positive rate is 1/1000 at that point
-        let saturated = self.saturated.load(Ordering::Relaxed);
-        if saturated || now.duration_since(self.age) > self.max_age {
-            let len = self.filter.len();
-            self.filter.clear();
-            self.filter.resize_with(len, AtomicU64::default);
-            self.seed = thread_rng().gen();
-            self.age = now;
-            self.saturated.store(false, Ordering::Relaxed);
-        }
+    fn false_positive_rate(&self) -> f64 {
+        let popcount = self.popcount.load(Ordering::Relaxed);
+        let ones_ratio = popcount.min(self.num_bits) as f64 / self.num_bits as f64;
+        ones_ratio.powi(K as i32)
     }
 
-    /// Compute hash from packet data, returns (hash, bin_pos).
-    fn compute_hash(&self, packet: &Packet) -> (u64, usize) {
-        let mut hasher = AHasher::new_with_keys(self.seed.0, self.seed.1);
-        hasher.write(packet.data(..).unwrap_or_default());
-        let h = hasher.finish();
-        let len = self.filter.len();
-        let pos = (usize::try_from(h).unwrap()).wrapping_rem(len);
-        (h, pos)
+    /// Resets the Deduper if either it is older than the reset_cycle or it is
+    /// saturated enough that false positive rate exceeds specified threshold.
+    /// Returns true if the deduper was saturated.
+    pub fn maybe_reset<R: Rng>(
+        &mut self,
+        rng: &mut R,
+        false_positive_rate: f64,
+        reset_cycle: Duration,
+    ) -> bool {
+        assert!(0.0 < false_positive_rate && false_positive_rate < 1.0);
+        let saturated = self.false_positive_rate() >= false_positive_rate;
+        if saturated || self.clock.elapsed() >= reset_cycle {
+            self.seeds = [(); K].map(|_| rng.gen());
+            self.clock = Instant::now();
+            self.bits.fill_with(AtomicU64::default);
+            self.popcount = AtomicU64::default();
+        }
+        saturated
     }
 
-    // Deduplicates packets and returns 1 if packet is to be discarded. Else, 0.
-    fn dedup_packet(&self, packet: &mut Packet) -> u64 {
-        // If this packet was already marked as discard, drop it
-        if packet.meta.discard() {
-            return 1;
+    // Returns true if the data is duplicate.
+    #[must_use]
+    #[allow(clippy::integer_arithmetic)]
+    pub fn dedup(&self, data: &T) -> bool {
+        let mut out = true;
+        for seed in self.seeds {
+            let mut hasher = AHasher::new_with_keys(seed.0, seed.1);
+            data.hash(&mut hasher);
+            let hash: u64 = hasher.finish() % self.num_bits;
+            let index = (hash >> 6) as usize;
+            let mask: u64 = 1u64 << (hash & 63);
+            let old = self.bits[index].fetch_or(mask, Ordering::Relaxed);
+            if old & mask == 0u64 {
+                self.popcount.fetch_add(1, Ordering::Relaxed);
+                out = false;
+            }
         }
-        let (hash, pos) = self.compute_hash(packet);
-        // saturate each position with or
-        let prev = self.filter[pos].fetch_or(hash, Ordering::Relaxed);
-        if prev == u64::MAX {
-            self.saturated.store(true, Ordering::Relaxed);
-            //reset this value
-            self.filter[pos].store(hash, Ordering::Relaxed);
-        }
-        if hash == prev & hash {
-            packet.meta.set_discard(true);
-            return 1;
-        }
-        0
+        out
     }
+}
 
-    pub fn dedup_packets_and_count_discards(
-        &self,
-        batches: &mut [PacketBatch],
-        mut process_received_packet: impl FnMut(&mut Packet, bool, bool),
-    ) -> u64 {
-        let mut num_removed: u64 = 0;
-        batches.iter_mut().for_each(|batch| {
-            batch.iter_mut().for_each(|p| {
-                let removed_before_sigverify = p.meta.discard();
-                let is_duplicate = self.dedup_packet(p);
-                if is_duplicate == 1 {
-                    saturating_add_assign!(num_removed, 1);
-                }
-                process_received_packet(p, removed_before_sigverify, is_duplicate == 1);
-            })
-        });
-        num_removed
-    }
+pub fn dedup_packets_and_count_discards<const K: usize>(
+    deduper: &Deduper<K, [u8]>,
+    batches: &mut [PacketBatch],
+    mut process_received_packet: impl FnMut(&mut Packet, bool, bool),
+) -> u64 {
+    batches
+        .iter_mut()
+        .flat_map(PacketBatch::iter_mut)
+        .map(|packet| {
+            if packet.meta.discard() {
+                process_received_packet(packet, true, false);
+            } else if packet
+                .data(..)
+                .map(|data| deduper.dedup(data))
+                .unwrap_or(true)
+            {
+                packet.meta.set_discard(true);
+                process_received_packet(packet, false, true);
+            } else {
+                process_received_packet(packet, false, false);
+            }
+            u64::from(packet.meta.discard())
+        })
+        .sum()
 }
 
 //inplace shrink a batch of packets
@@ -662,26 +680,18 @@ pub fn ed25519_verify_disabled(batches: &mut [PacketBatch]) {
     inc_new_counter_debug!("ed25519_verify_disabled", packet_count);
 }
 
-pub fn copy_return_values(sig_lens: &[Vec<u32>], out: &PinnedVec<u8>, rvs: &mut [Vec<u8>]) {
-    let mut num = 0;
-    for (vs, sig_vs) in rvs.iter_mut().zip(sig_lens.iter()) {
-        for (v, sig_v) in vs.iter_mut().zip(sig_vs.iter()) {
-            if *sig_v == 0 {
-                *v = 0;
-            } else {
-                let mut vout = 1;
-                for _ in 0..*sig_v {
-                    if 0 == out[num] {
-                        vout = 0;
-                    }
-                    num = num.saturating_add(1);
-                }
-                *v = vout;
-            }
-            if *v != 0 {
-                trace!("VERIFIED PACKET!!!!!");
-            }
-        }
+pub fn copy_return_values<I, T>(sig_lens: I, out: &PinnedVec<u8>, rvs: &mut [Vec<u8>])
+where
+    I: IntoIterator<Item = T>,
+    T: IntoIterator<Item = u32>,
+{
+    debug_assert!(rvs.iter().flatten().all(|&rv| rv == 0u8));
+    let mut offset = 0usize;
+    let rvs = rvs.iter_mut().flatten();
+    for (k, rv) in sig_lens.into_iter().flatten().zip(rvs) {
+        let out = out[offset..].iter().take(k as usize).all(|&x| x == 1u8);
+        *rv = u8::from(k != 0u32 && out);
+        offset = offset.saturating_add(k as usize);
     }
 }
 
@@ -794,7 +804,7 @@ pub fn ed25519_verify(
         }
     }
     trace!("done verify");
-    copy_return_values(&sig_lens, &out, &mut rvs);
+    copy_return_values(sig_lens, &out, &mut rvs);
     mark_disabled(batches, &rvs);
     inc_new_counter_debug!("ed25519_verify_gpu", valid_packet_count);
 }
@@ -811,14 +821,20 @@ mod tests {
         },
         bincode::{deserialize, serialize},
         curve25519_dalek::{edwards::CompressedEdwardsY, scalar::Scalar},
-        rand::{thread_rng, Rng},
+        rand::{thread_rng, Rng, SeedableRng},
+        rand_chacha::ChaChaRng,
         solana_sdk::{
             instruction::CompiledInstruction,
             message::{Message, MessageHeader},
+            packet::Meta,
             signature::{Keypair, Signature, Signer},
             transaction::Transaction,
         },
-        std::sync::atomic::{AtomicU64, Ordering},
+        std::{
+            iter::repeat_with,
+            sync::atomic::{AtomicU64, Ordering},
+        },
+        test_case::test_case,
     };
 
     const SIG_OFFSET: usize = 1;
@@ -832,6 +848,45 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn test_copy_return_values() {
+        let mut rng = rand::thread_rng();
+        let sig_lens: Vec<Vec<u32>> = {
+            let size = rng.gen_range(0, 64);
+            repeat_with(|| {
+                let size = rng.gen_range(0, 16);
+                repeat_with(|| rng.gen_range(0, 5)).take(size).collect()
+            })
+            .take(size)
+            .collect()
+        };
+        let out: Vec<Vec<Vec<bool>>> = sig_lens
+            .iter()
+            .map(|sig_lens| {
+                sig_lens
+                    .iter()
+                    .map(|&size| repeat_with(|| rng.gen()).take(size as usize).collect())
+                    .collect()
+            })
+            .collect();
+        let expected: Vec<Vec<u8>> = out
+            .iter()
+            .map(|out| {
+                out.iter()
+                    .map(|out| u8::from(!out.is_empty() && out.iter().all(|&k| k)))
+                    .collect()
+            })
+            .collect();
+        let out =
+            PinnedVec::<u8>::from_vec(out.into_iter().flatten().flatten().map(u8::from).collect());
+        let mut rvs: Vec<Vec<u8>> = sig_lens
+            .iter()
+            .map(|sig_lens| vec![0u8; sig_lens.len()])
+            .collect();
+        copy_return_values(sig_lens, &out, &mut rvs);
+        assert_eq!(rvs, expected);
     }
 
     #[test]
@@ -1443,7 +1498,7 @@ mod tests {
             assert!(!packet.meta.is_simple_vote_tx());
         }
 
-        // single vote tx is
+        // single legacy vote tx is
         {
             let mut tx = new_test_vote_tx(&mut rng);
             tx.message.instructions[0].data = vec![1, 2, 3];
@@ -1451,6 +1506,26 @@ mod tests {
             let packet_offsets = do_get_packet_offsets(&packet, 0).unwrap();
             check_for_simple_vote_transaction(&mut packet, &packet_offsets, 0).ok();
             assert!(packet.meta.is_simple_vote_tx());
+        }
+
+        // single versioned vote tx is not
+        {
+            let mut tx = new_test_vote_tx(&mut rng);
+            tx.message.instructions[0].data = vec![1, 2, 3];
+            let mut packet = Packet::from_data(None, tx).unwrap();
+
+            // set messager version to v0
+            let mut packet_offsets = do_get_packet_offsets(&packet, 0).unwrap();
+            let msg_start = packet_offsets.msg_start as usize;
+            let msg_bytes = packet.data(msg_start..).unwrap().to_vec();
+            packet.buffer_mut()[msg_start] = MESSAGE_VERSION_PREFIX;
+            packet.meta.size += 1;
+            let msg_end = packet.meta.size;
+            packet.buffer_mut()[msg_start + 1..msg_end].copy_from_slice(&msg_bytes);
+
+            packet_offsets = do_get_packet_offsets(&packet, 0).unwrap();
+            check_for_simple_vote_transaction(&mut packet, &packet_offsets, 0).ok();
+            assert!(!packet.meta.is_simple_vote_tx());
         }
 
         // multiple mixed tx is not
@@ -1480,22 +1555,52 @@ mod tests {
         solana_logger::setup();
         let mut rng = rand::thread_rng();
 
-        let mut current_offset = 0usize;
-        let mut batch = PacketBatch::default();
-        batch.push(Packet::from_data(None, test_tx()).unwrap());
-        let tx = new_test_vote_tx(&mut rng);
-        batch.push(Packet::from_data(None, tx).unwrap());
-        batch.iter_mut().enumerate().for_each(|(index, packet)| {
-            let packet_offsets = do_get_packet_offsets(packet, current_offset).unwrap();
-            check_for_simple_vote_transaction(packet, &packet_offsets, current_offset).ok();
-            if index == 1 {
-                assert!(packet.meta.is_simple_vote_tx());
-            } else {
-                assert!(!packet.meta.is_simple_vote_tx());
-            }
+        // batch of legacy messages
+        {
+            let mut current_offset = 0usize;
+            let mut batch = PacketBatch::default();
+            batch.push(Packet::from_data(None, test_tx()).unwrap());
+            let tx = new_test_vote_tx(&mut rng);
+            batch.push(Packet::from_data(None, tx).unwrap());
+            batch.iter_mut().enumerate().for_each(|(index, packet)| {
+                let packet_offsets = do_get_packet_offsets(packet, current_offset).unwrap();
+                check_for_simple_vote_transaction(packet, &packet_offsets, current_offset).ok();
+                if index == 1 {
+                    assert!(packet.meta.is_simple_vote_tx());
+                } else {
+                    assert!(!packet.meta.is_simple_vote_tx());
+                }
 
-            current_offset = current_offset.saturating_add(size_of::<Packet>());
-        });
+                current_offset = current_offset.saturating_add(size_of::<Packet>());
+            });
+        }
+
+        // batch of mixed legacy messages and versioned vote tx, which won't be flagged as
+        // simple_vote_tx
+        {
+            let mut current_offset = 0usize;
+            let mut batch = PacketBatch::default();
+            batch.push(Packet::from_data(None, test_tx()).unwrap());
+            // versioned vote tx
+            let tx = new_test_vote_tx(&mut rng);
+            let mut packet = Packet::from_data(None, tx).unwrap();
+            let packet_offsets = do_get_packet_offsets(&packet, 0).unwrap();
+            let msg_start = packet_offsets.msg_start as usize;
+            let msg_bytes = packet.data(msg_start..).unwrap().to_vec();
+            packet.buffer_mut()[msg_start] = MESSAGE_VERSION_PREFIX;
+            packet.meta.size += 1;
+            let msg_end = packet.meta.size;
+            packet.buffer_mut()[msg_start + 1..msg_end].copy_from_slice(&msg_bytes);
+            batch.push(packet);
+
+            batch.iter_mut().for_each(|packet| {
+                let packet_offsets = do_get_packet_offsets(packet, current_offset).unwrap();
+                check_for_simple_vote_transaction(packet, &packet_offsets, current_offset).ok();
+                assert!(!packet.meta.is_simple_vote_tx());
+
+                current_offset = current_offset.saturating_add(size_of::<Packet>());
+            });
+        }
     }
 
     #[test]
@@ -1505,9 +1610,11 @@ mod tests {
         let mut batches =
             to_packet_batches(&std::iter::repeat(tx).take(1024).collect::<Vec<_>>(), 128);
         let packet_count = sigverify::count_packets_in_batches(&batches);
-        let filter = Deduper::new(1_000_000, Duration::from_millis(0));
+        let mut rng = rand::thread_rng();
+        let filter = Deduper::<2, [u8]>::new(&mut rng, /*num_bits:*/ 63_999_979);
         let mut num_deduped = 0;
-        let discard = filter.dedup_packets_and_count_discards(
+        let discard = dedup_packets_and_count_discards(
+            &filter,
             &mut batches,
             |_deduped_packet, _removed_before_sigverify_stage, _is_dup| {
                 num_deduped += 1;
@@ -1519,86 +1626,136 @@ mod tests {
 
     #[test]
     fn test_dedup_diff() {
-        let mut filter = Deduper::new(1_000_000, Duration::from_millis(0));
+        let mut rng = rand::thread_rng();
+        let mut filter = Deduper::<2, [u8]>::new(&mut rng, /*num_bits:*/ 63_999_979);
         let mut batches = to_packet_batches(&(0..1024).map(|_| test_tx()).collect::<Vec<_>>(), 128);
-        let discard = filter.dedup_packets_and_count_discards(&mut batches, |_, _, _| ()) as usize;
+        let discard =
+            dedup_packets_and_count_discards(&filter, &mut batches, |_, _, _| ()) as usize;
         // because dedup uses a threadpool, there maybe up to N threads of txs that go through
         assert_eq!(discard, 0);
-        filter.reset();
-        for i in filter.filter {
+        assert!(!filter.maybe_reset(
+            &mut rng,
+            0.001,                    // false_positive_rate
+            Duration::from_millis(0), // reset_cycle
+        ));
+        for i in filter.bits {
             assert_eq!(i.load(Ordering::Relaxed), 0);
         }
+    }
+
+    fn get_capacity<const K: usize>(num_bits: u64, false_positive_rate: f64) -> u64 {
+        (num_bits as f64 * false_positive_rate.powf(1f64 / K as f64)) as u64
     }
 
     #[test]
     #[ignore]
     fn test_dedup_saturated() {
-        let filter = Deduper::new(1_000_000, Duration::from_millis(0));
+        const NUM_BITS: u64 = 63_999_979;
+        const FALSE_POSITIVE_RATE: f64 = 0.001;
+        let mut rng = rand::thread_rng();
+        let mut filter = Deduper::<2, [u8]>::new(&mut rng, NUM_BITS);
+        let capacity = get_capacity::<2>(NUM_BITS, FALSE_POSITIVE_RATE);
         let mut discard = 0;
-        assert!(!filter.saturated.load(Ordering::Relaxed));
+        assert!(filter.popcount.load(Ordering::Relaxed) < capacity);
         for i in 0..1000 {
             let mut batches =
                 to_packet_batches(&(0..1000).map(|_| test_tx()).collect::<Vec<_>>(), 128);
-            discard += filter.dedup_packets_and_count_discards(&mut batches, |_, _, _| ()) as usize;
+            discard +=
+                dedup_packets_and_count_discards(&filter, &mut batches, |_, _, _| ()) as usize;
             trace!("{} {}", i, discard);
-            if filter.saturated.load(Ordering::Relaxed) {
+            if filter.popcount.load(Ordering::Relaxed) > capacity {
                 break;
             }
         }
-        assert!(filter.saturated.load(Ordering::Relaxed));
+        assert!(filter.popcount.load(Ordering::Relaxed) > capacity);
+        assert!(filter.false_positive_rate() >= FALSE_POSITIVE_RATE);
+        assert!(filter.maybe_reset(
+            &mut rng,
+            FALSE_POSITIVE_RATE,
+            Duration::from_millis(0), // reset_cycle
+        ));
     }
 
     #[test]
     fn test_dedup_false_positive() {
-        let filter = Deduper::new(1_000_000, Duration::from_millis(0));
+        let mut rng = rand::thread_rng();
+        let filter = Deduper::<2, [u8]>::new(&mut rng, /*num_bits:*/ 63_999_979);
         let mut discard = 0;
         for i in 0..10 {
             let mut batches =
                 to_packet_batches(&(0..1024).map(|_| test_tx()).collect::<Vec<_>>(), 128);
-            discard += filter.dedup_packets_and_count_discards(&mut batches, |_, _, _| ()) as usize;
+            discard +=
+                dedup_packets_and_count_discards(&filter, &mut batches, |_, _, _| ()) as usize;
             debug!("false positive rate: {}/{}", discard, i * 1024);
         }
         //allow for 1 false positive even if extremely unlikely
         assert!(discard < 2);
     }
 
-    #[test]
-    fn test_shrink_fuzz() {
-        for _ in 0..5 {
-            let mut batches = to_packet_batches(
-                &(0..PACKETS_PER_BATCH * 3)
-                    .map(|_| test_tx())
-                    .collect::<Vec<_>>(),
-                PACKETS_PER_BATCH,
-            );
-            batches.iter_mut().for_each(|b| {
-                b.iter_mut()
-                    .for_each(|p| p.meta.set_discard(thread_rng().gen()))
-            });
-            //find all the non discarded packets
-            let mut start = vec![];
-            batches.iter_mut().for_each(|b| {
-                b.iter_mut()
-                    .filter(|p| !p.meta.discard())
-                    .for_each(|p| start.push(p.clone()))
-            });
-            start.sort_by(|a, b| a.data(..).cmp(&b.data(..)));
+    #[test_case(63_999_979, 0.001, 2_023_857)]
+    #[test_case(622_401_961, 0.001, 19_682_078)]
+    #[test_case(622_401_979, 0.001, 19_682_078)]
+    #[test_case(629_145_593, 0.001, 19_895_330)]
+    #[test_case(632_455_543, 0.001, 20_000_000)]
+    #[test_case(637_534_199, 0.001, 20_160_601)]
+    #[test_case(622_401_961, 0.0001, 6_224_019)]
+    #[test_case(622_401_979, 0.0001, 6_224_019)]
+    #[test_case(629_145_593, 0.0001, 6_291_455)]
+    #[test_case(632_455_543, 0.0001, 6_324_555)]
+    #[test_case(637_534_199, 0.0001, 6_375_341)]
+    fn test_dedup_capacity(num_bits: u64, false_positive_rate: f64, capacity: u64) {
+        let mut rng = rand::thread_rng();
+        assert_eq!(get_capacity::<2>(num_bits, false_positive_rate), capacity);
+        let mut deduper = Deduper::<2, [u8]>::new(&mut rng, num_bits);
+        assert_eq!(deduper.false_positive_rate(), 0.0);
+        deduper.popcount.store(capacity, Ordering::Relaxed);
+        assert!(deduper.false_positive_rate() < false_positive_rate);
+        deduper.popcount.store(capacity + 1, Ordering::Relaxed);
+        assert!(deduper.false_positive_rate() >= false_positive_rate);
+        assert!(deduper.maybe_reset(
+            &mut rng,
+            false_positive_rate,
+            Duration::from_millis(0), // reset_cycle
+        ));
+    }
 
-            let packet_count = count_valid_packets(&batches, |_| ());
-            shrink_batches(&mut batches);
-
-            //make sure all the non discarded packets are the same
-            let mut end = vec![];
-            batches.iter_mut().for_each(|b| {
-                b.iter_mut()
-                    .filter(|p| !p.meta.discard())
-                    .for_each(|p| end.push(p.clone()))
-            });
-            end.sort_by(|a, b| a.data(..).cmp(&b.data(..)));
-            let packet_count2 = count_valid_packets(&batches, |_| ());
-            assert_eq!(packet_count, packet_count2);
-            assert_eq!(start, end);
+    #[test_case([0xf9; 32],  3_199_997, 101_192,  51_414,  70, 101_125)]
+    #[test_case([0xdc; 32],  3_200_003, 101_192,  51_414,  71, 101_132)]
+    #[test_case([0xa5; 32],  6_399_971, 202_384, 102_828, 127, 202_157)]
+    #[test_case([0xdb; 32],  6_400_013, 202_386, 102_828, 145, 202_277)]
+    #[test_case([0xcd; 32], 12_799_987, 404_771, 205_655, 289, 404_434)]
+    #[test_case([0xc3; 32], 12_800_009, 404_771, 205_656, 309, 404_278)]
+    fn test_dedup_seeded(
+        seed: [u8; 32],
+        num_bits: u64,
+        capacity: u64,
+        num_packets: usize,
+        num_dups: usize,
+        popcount: u64,
+    ) {
+        const FALSE_POSITIVE_RATE: f64 = 0.001;
+        let mut rng = ChaChaRng::from_seed(seed);
+        let mut deduper = Deduper::<2, [u8]>::new(&mut rng, num_bits);
+        assert_eq!(get_capacity::<2>(num_bits, FALSE_POSITIVE_RATE), capacity);
+        let mut packet = Packet::new([0u8; PACKET_DATA_SIZE], Meta::default());
+        let mut dup_count = 0usize;
+        for _ in 0..num_packets {
+            let size = rng.gen_range(0, PACKET_DATA_SIZE);
+            packet.meta.size = size;
+            rng.fill(&mut packet.buffer_mut()[0..size]);
+            if deduper.dedup(packet.data(..).unwrap()) {
+                dup_count += 1;
+            }
+            assert!(deduper.dedup(packet.data(..).unwrap()));
         }
+        assert_eq!(dup_count, num_dups);
+        assert_eq!(deduper.popcount.load(Ordering::Relaxed), popcount);
+        assert!(deduper.false_positive_rate() < FALSE_POSITIVE_RATE);
+        assert!(!deduper.maybe_reset(
+            &mut rng,
+            FALSE_POSITIVE_RATE,
+            Duration::from_millis(0), // reset_cycle
+        ));
     }
 
     #[test]

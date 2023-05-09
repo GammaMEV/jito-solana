@@ -18,7 +18,7 @@ use {
 #[clap(author, version, about, long_about = None)]
 struct Args {
     /// Ledger path, where you created the snapshot.
-    #[clap(long, env, parse(try_from_str = Args::ledger_path_parser))]
+    #[clap(long, env, value_parser = Args::ledger_path_parser)]
     ledger_path: PathBuf,
 
     /// The tip-distribution program id.
